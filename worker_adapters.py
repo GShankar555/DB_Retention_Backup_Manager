@@ -384,18 +384,20 @@ def table_columns(connection, job: Any, schema: str | None, table: str) -> set[s
     return {str(row["column_name"] if "column_name" in row else row["COLUMN_NAME"]) for row in cursor_rows(cursor)}
 
 
-def age_column(connection, job: Any, schema: str | None, table: str) -> str:
+def age_column_candidates(job: Any) -> list[str]:
+    raw = str(field(job, "retention_column", "created_at"))
+    return [candidate.strip() for candidate in raw.split(",") if candidate.strip()]
+
+
+def age_column(connection, job: Any, schema: str | None, table: str) -> str | None:
     columns = table_columns(connection, job, schema, table)
-    requested = str(field(job, "retention_column", "created_at")).strip()
-    if requested in columns:
-        return requested
     lowered = {column.lower(): column for column in columns}
-    if requested.lower() in lowered:
-        return lowered[requested.lower()]
-    for candidate in ("created_at", "createdAt", "created_on", "timestamp", "event_time", "updated_at", "date"):
+    for candidate in age_column_candidates(job):
+        if candidate in columns:
+            return candidate
         if candidate.lower() in lowered:
             return lowered[candidate.lower()]
-    raise AdapterError(f"No age column '{requested}' was found on {table_reference(engine_name(job), schema, table)}.")
+    return None
 
 
 def write_archive(rows: list[dict[str, Any]], path: Path, archive_format: str) -> str:
@@ -445,7 +447,7 @@ def process_mongodb_job(job: Any, run_id: int, temp_dir: Path, archive: bool) ->
     if not collections:
         client.close()
         raise AdapterError("No MongoDB collections were found in the selected scope.")
-    requested_column = str(field(job, "retention_column", "created_at"))
+    requested_columns = age_column_candidates(job)
     days = int(field(job, "retention_days", 730) or 730)
     if days < 1:
         client.close()
@@ -455,6 +457,11 @@ def process_mongodb_job(job: Any, run_id: int, temp_dir: Path, archive: bool) ->
     try:
         for collection_name in collections:
             collection = database[collection_name]
+            sample = collection.find_one()
+            requested_column = next((candidate for candidate in requested_columns if candidate in (sample or {})), None)
+            if not requested_column:
+                results.append({"table": collection_name, "rows": 0, "deleted": 0, "skipped": True, "message": "No configured age column found; collection skipped."})
+                continue
             query = {requested_column: {"$lt": cutoff}}
             rows = [{str(key): document_value(value) for key, value in row.items()} for row in collection.find(query)]
             if not rows:
@@ -477,10 +484,12 @@ def process_mongodb_job(job: Any, run_id: int, temp_dir: Path, archive: bool) ->
     return results
 
 
-def old_rows(connection, job: Any, schema: str | None, table: str) -> tuple[str, list[dict[str, Any]], Any]:
+def old_rows(connection, job: Any, schema: str | None, table: str, column: str | None = None) -> tuple[str, list[dict[str, Any]], Any]:
     engine = engine_name(job)
     reference = table_reference(engine, schema, table)
-    column = age_column(connection, job, schema, table)
+    column = column or age_column(connection, job, schema, table)
+    if not column:
+        raise AdapterError(f"No configured age column was found on {reference}.")
     days = int(field(job, "retention_days", 730) or 730)
     if days < 1:
         raise AdapterError("Retention window must be at least one day.")
@@ -500,8 +509,16 @@ def preview_row_job(job: Any) -> list[dict[str, Any]]:
                 raise AdapterError("No MongoDB collections were found in the selected scope.")
             days = int(field(job, "retention_days", 730) or 730)
             cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
-            column = str(field(job, "retention_column", "created_at"))
-            return [{"table": name, "rows": database[name].count_documents({column: {"$lt": cutoff}}), "age_column": column} for name in collections]
+            requested_columns = age_column_candidates(job)
+            results = []
+            for name in collections:
+                sample = database[name].find_one()
+                column = next((candidate for candidate in requested_columns if candidate in (sample or {})), None)
+                if not column:
+                    results.append({"table": name, "rows": 0, "age_column": None, "skipped": True, "message": "No configured age column found; collection skipped."})
+                else:
+                    results.append({"table": name, "rows": database[name].count_documents({column: {"$lt": cutoff}}), "age_column": column})
+            return results
         finally:
             client.close()
     connection = connect_database(job)
@@ -515,6 +532,9 @@ def preview_row_job(job: Any) -> list[dict[str, Any]]:
         for schema, table in selected_tables(connection, job):
             column = age_column(connection, job, schema, table)
             reference = table_reference(engine, schema, table)
+            if not column:
+                results.append({"table": reference, "rows": 0, "age_column": None, "skipped": True, "message": "No configured age column found; table skipped."})
+                continue
             cursor = connection.cursor()
             cursor.execute(f"SELECT COUNT(*) AS row_count FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}", (cutoff,))
             row = cursor_rows(cursor)[0]
@@ -532,12 +552,18 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
     engine = engine_name(job)
     try:
         tables = selected_tables(connection, job)
-        # Resolve every age column before deleting anything. A bad table in an
-        # all-tables scope must fail the job before an earlier table is changed.
+        prepared = []
         for schema, table in tables:
-            age_column(connection, job, schema, table)
-        for schema, table in tables:
-            column, rows, cutoff = old_rows(connection, job, schema, table)
+            column = age_column(connection, job, schema, table)
+            reference = table_reference(engine, schema, table)
+            if column:
+                prepared.append((schema, table, column))
+            else:
+                results.append({"table": reference, "rows": 0, "deleted": 0, "skipped": True, "message": "No configured age column found; table skipped."})
+        if not prepared:
+            return results
+        for schema, table, column in prepared:
+            column, rows, cutoff = old_rows(connection, job, schema, table, column)
             reference = table_reference(engine, schema, table)
             if not rows:
                 results.append({"table": reference, "rows": 0, "deleted": 0})

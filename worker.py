@@ -98,10 +98,14 @@ def run_job(job_id: int) -> int:
                     db.commit()
                     total_rows = sum(int(item.get("rows", 0)) for item in results)
                     total_deleted = sum(int(item.get("deleted", 0)) for item in results)
+                    skipped = sum(1 for item in results if item.get("skipped"))
                     db.execute("UPDATE job_runs SET rows_processed = ?, rows_deleted = ? WHERE id = ?", (total_rows, total_deleted, run_id))
                     db.commit()
+                    if skipped:
+                        event(run_id, "running", 82, f"Skipped {skipped} table(s) without a matching age column")
                     action = "Archived to R2 and removed" if archive else "Removed"
-                    event(run_id, "running", 90, f"{action} {total_deleted} old row(s) across {len(results)} table(s)")
+                    processed_tables = len(results) - skipped
+                    event(run_id, "running", 90, f"{action} {total_deleted} old row(s) across {processed_tables} table(s)")
                     event(run_id, "success", 100, f"{action} {total_rows} eligible row(s) successfully", finish=True)
                     return 0
                 raise AdapterError(f"Unsupported job type: {job['job_type']}")

@@ -145,6 +145,18 @@ def init_db() -> None:
         db.execute("ALTER TABLE job_runs ADD COLUMN rows_processed INTEGER NOT NULL DEFAULT 0")
     if "rows_deleted" not in run_columns:
         db.execute("ALTER TABLE job_runs ADD COLUMN rows_deleted INTEGER NOT NULL DEFAULT 0")
+    # Seed the reusable default target from an existing configured job once.
+    existing_default = db.execute("SELECT 1 FROM settings WHERE key = 'r2_account_id'").fetchone()
+    if not existing_default:
+        source = db.execute("""SELECT r2_account_id, r2_bucket, r2_access_key, r2_secret_key
+                              FROM jobs
+                              WHERE COALESCE(r2_account_id, '') <> ''
+                                 OR COALESCE(r2_bucket, '') <> ''
+                                 OR COALESCE(r2_access_key, '') <> ''
+                              ORDER BY id LIMIT 1""").fetchone()
+        if source:
+            for key in ("r2_account_id", "r2_bucket", "r2_access_key", "r2_secret_key"):
+                db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, source[key] or ""))
     db.commit()
 
 
@@ -376,6 +388,7 @@ def inject_globals():
         "nav_counts": {
             "Jobs": db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
             "Connections": db.execute("SELECT COUNT(*) FROM connections").fetchone()[0],
+            "Retention": db.execute("SELECT COUNT(*) FROM jobs WHERE job_type IN ('retention', 'archive')").fetchone()[0],
         },
         "logged_in_user": session.get("username"),
         "scheduler_status": scheduler_info(),
@@ -478,6 +491,8 @@ def new_job():
     form = request.form if request.method == "POST" else {
         "r2_account_id": setting_value("r2_account_id"),
         "r2_bucket": setting_value("r2_bucket") or "vaultline-prod",
+        "r2_access_key": setting_value("r2_access_key"),
+        "r2_secret_key": setting_value("r2_secret_key"),
     }
     return render_template("job_form.html", active="Jobs", connections=connections, job=None, form=form)
 
@@ -595,6 +610,8 @@ def settings():
         r2_account_id=setting_value("r2_account_id"),
         r2_bucket=setting_value("r2_bucket"),
         r2_endpoint=setting_value("r2_endpoint"),
+        r2_access_key=setting_value("r2_access_key"),
+        r2_secret_key=setting_value("r2_secret_key"),
         scheduler=scheduler_info(),
     )
 
@@ -805,14 +822,14 @@ def api_sqlite_backup():
 @app.route("/api/settings/r2", methods=["GET", "POST"])
 def api_r2_settings():
     db = get_db()
-    keys = ("r2_account_id", "r2_bucket", "r2_endpoint")
+    keys = ("r2_account_id", "r2_bucket", "r2_endpoint", "r2_access_key", "r2_secret_key")
     if request.method == "POST":
         source = request.get_json(silent=True) or request.form
         for key in keys:
             db.execute("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP", (key, (source.get(key) or "").strip()))
         db.commit()
         log_activity("R2 settings updated", source.get("r2_bucket") or "Default R2 target", "blue")
-    return jsonify({key: setting_value(key) for key in keys})
+    return jsonify({key: setting_value(key) for key in keys if key != "r2_secret_key"})
 
 
 if __name__ == "__main__":
