@@ -1,0 +1,1 @@
+<div class="activity-list">{% for item in activities %}<div class="activity-row"><span class="activity-icon {{ item.tone }}">{% if item.tone == 'amber' %}!{% elif item.tone == 'blue' %}↗{% else %}✓{% endif %}</span><span><strong>{{ item.title }}</strong><small>{{ item.detail }}</small></span><time>{{ item.created_at[:16] }}</time></div>{% endfor %}</div>

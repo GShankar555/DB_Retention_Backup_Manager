@@ -1,0 +1,5 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-header"><div><p class="eyebrow"><i></i> AUDIT TRAIL</p><h1>Activity</h1><p class="subtitle">A complete record of backups, purges and configuration changes.</p></div></div>
+<section class="card activity-page-card"><div class="card-heading"><div><h2>Everything that happened</h2><p>Newest events appear first.</p></div></div>{% include '_activity.html' %}</section>
+{% endblock %}

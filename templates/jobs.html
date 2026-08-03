@@ -1,0 +1,5 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-header"><div><p class="eyebrow"><i></i> SCHEDULED OPERATIONS</p><h1>Jobs</h1><p class="subtitle">Backups, archives and retention policies installed as system cron jobs.</p></div><div class="header-actions"><a class="button primary" href="{{ url_for('new_job') }}">+ &nbsp;New job</a></div></div>
+<section class="card table-card full-card"><div class="card-heading table-heading"><div><h2>All scheduled jobs</h2><p>SQLite keeps the configuration local to your Linode VM.</p></div><button class="button filter">☷ &nbsp;Filters</button></div>{% include '_jobs_table.html' %}</section>
+{% endblock %}

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vaultline · {{ active or 'Overview' }}</title>
+  <meta name="description" content="Universal database backup, retention and archive manager for Linode and Cloudflare R2.">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark">⌁</span><span>vaultline</span></a>
+      <div class="workspace"><span class="workspace-badge">AC</span><span><strong>Acme Corp</strong><small>Workspace</small></span><span class="chevron">⌄</span></div>
+      <p class="nav-title">Workspace</p>
+      <nav>
+        {% for label, endpoint, symbol in [('Overview','dashboard','◈'),('Jobs','jobs','◌'),('Connections','connections','▦'),('Retention','retention','◇')] %}
+          <a class="nav-link {% if active == label %}active{% endif %}" href="{{ url_for(endpoint) }}"><span class="nav-symbol">{{ symbol }}</span><span>{{ label }}</span>{% if nav_counts.get(label, 0) %}<em>{{ nav_counts[label] }}</em>{% endif %}</a>
+        {% endfor %}
+      </nav>
+      <p class="nav-title system-title">System</p>
+      <nav>
+        {% for label, endpoint, symbol in [('Activity','activity','≋'),('Settings','settings','⚙')] %}
+          <a class="nav-link {% if active == label %}active{% endif %}" href="{{ url_for(endpoint) }}"><span class="nav-symbol">{{ symbol }}</span><span>{{ label }}</span></a>
+        {% endfor %}
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="agent-status"><span class="agent-icon">✦</span><span><strong>Linode agent</strong><small><i class="offline-dot"></i> Not configured</small></span><span class="more">···</span></div>
+        <div class="account"><span class="account-avatar">VA</span><span><strong>{{ logged_in_user or 'Vaultline admin' }}</strong><small>Administrator</small></span><form method="post" action="{{ url_for('logout') }}"><button class="logout-link" title="Log out">↪</button></form></div>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div class="crumbs"><span>Acme Corp</span><b>/</b><strong>{{ active or 'Overview' }}</strong></div><div class="top-actions"><button class="top-icon" id="search-button" aria-label="Search">⌕</button><button class="top-icon notification" aria-label="Notifications">♢<i></i></button><span class="top-avatar">PS</span></div></header>
+      <div class="page">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}<div class="flash-stack">{% for category, message in messages %}<div class="flash {{ category }}"><span>{% if category == 'success' %}✓{% else %}!{% endif %}</span>{{ message }}</div>{% endfor %}</div>{% endif %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+      </div>
+    </main>
+  </div>
+  <div class="search-drawer" id="search-drawer" hidden><form><input autofocus placeholder="Search jobs, connections..." id="global-search"><button type="button" id="close-search">×</button></form></div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
