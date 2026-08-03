@@ -30,7 +30,7 @@
       </div>
     </aside>
     <main class="main">
-      <header class="topbar"><div class="crumbs"><span>Acme Corp</span><b>/</b><strong>{{ active or 'Overview' }}</strong></div><div class="top-actions"><button class="top-icon" id="search-button" aria-label="Search">⌕</button><button class="top-icon notification" aria-label="Notifications">♢<i></i></button><span class="top-avatar">PS</span></div></header>
+      <header class="topbar"><div class="crumbs"><span>Vaultline</span><b>/</b><strong>{{ active or 'Overview' }}</strong></div><div class="top-actions"><button class="top-icon" id="search-button" aria-label="Search">⌕</button><a class="top-icon notification" href="{{ url_for('activity') }}" aria-label="Activity">♢</a><span class="top-avatar">VA</span></div></header>
       <div class="page">
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}<div class="flash-stack">{% for category, message in messages %}<div class="flash {{ category }}"><span>{% if category == 'success' %}✓{% else %}!{% endif %}</span>{{ message }}</div>{% endfor %}</div>{% endif %}
@@ -39,7 +39,7 @@
       </div>
     </main>
   </div>
-  <div class="search-drawer" id="search-drawer" hidden><form><input autofocus placeholder="Search jobs, connections..." id="global-search"><button type="button" id="close-search">×</button></form></div>
+  <div class="search-drawer" id="search-drawer" hidden><form id="search-form"><input autofocus placeholder="Search jobs, connections..." id="global-search"><button type="button" id="close-search">×</button></form><div id="search-results" class="search-results"></div></div>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

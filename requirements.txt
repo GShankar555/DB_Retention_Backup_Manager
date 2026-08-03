@@ -1,1 +1,5 @@
 Flask>=3.0,<4.0
+psycopg[binary]>=3.2,<4.0
+PyMySQL>=1.1,<2.0
+pymongo>=4.8,<5.0
+gunicorn>=20.0,<21.0

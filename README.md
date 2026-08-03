@@ -14,6 +14,7 @@ Flask-first control plane for universal database backups, retention and archive 
 - Dry-run protection and an activity/audit view.
 - Simple session authentication with the provided administrator credentials.
 - Authenticated JSON endpoints: `/api/health`, `/api/jobs`, and `/api/connections`.
+- Working control APIs for connection testing, search, CSV export, retention dry runs, SQLite backup, R2 settings and metrics.
 
 ## Build plan for the production worker
 
@@ -31,6 +32,8 @@ python3 -m venv .venv
 pip install -r requirements.txt
 python app.py
 ```
+
+The connection tester uses `psycopg` for PostgreSQL, `PyMySQL` for MySQL/MariaDB, and `pymongo` for MongoDB. SQL Server testing requires `pyodbc` plus Microsoft ODBC Driver 18 to be installed on the Linode VM.
 
 Open `http://localhost:5000`. The SQLite database is created at `instance/vaultline.db` unless `VAULTLINE_DB` is set.
 

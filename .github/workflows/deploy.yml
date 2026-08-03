@@ -1,0 +1,38 @@
+name: Deploy to Linode
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy to Linode via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ vars.SERVER_IP }}
+          username: ${{ vars.SERVER_NAME }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: 22
+          script: |
+            set -e
+
+            cd /var/www/DB_Retention_Backup_Manager
+
+            git fetch origin
+            git reset --hard origin/main
+
+            source venv/bin/activate
+
+            pip install -r requirements.txt
+
+            sudo systemctl restart gunicorn_db_manager
+            sudo systemctl reload nginx
+
+            deactivate

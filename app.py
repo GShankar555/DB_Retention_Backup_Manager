@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import csv
+import io
 import sqlite3
 import secrets
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, flash, g, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, Response, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -82,6 +84,11 @@ def init_db() -> None:
             tone TEXT NOT NULL DEFAULT 'teal',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
     db.commit()
@@ -107,6 +114,90 @@ def log_activity(title: str, detail: str, tone: str = "teal") -> None:
     db = get_db()
     db.execute("INSERT INTO activity (title, detail, tone) VALUES (?, ?, ?)", (title, detail, tone))
     db.commit()
+
+
+def connection_fields(source: dict) -> dict:
+    try:
+        port = int(source.get("port") or 5432)
+    except (TypeError, ValueError):
+        port = 0
+    return {
+        "name": (source.get("name") or "").strip(),
+        "engine": source.get("engine", "PostgreSQL"),
+        "host": (source.get("host") or "").strip(),
+        "port": port,
+        "database_name": (source.get("database_name") or "").strip(),
+        "username": (source.get("username") or "").strip(),
+        "password": source.get("password") or "",
+        "ssl_mode": source.get("ssl_mode", "require"),
+    }
+
+
+def test_database_connection(source: dict) -> tuple[bool, str]:
+    """Test a saved or unsaved connection using the matching optional driver."""
+    data = connection_fields(source)
+    if not data["host"] or not data["database_name"] or not data["username"] or not 1 <= data["port"] <= 65535:
+        return False, "Valid host, port, database name and username are required."
+    engine = data["engine"].lower()
+    try:
+        if engine == "postgresql":
+            try:
+                import psycopg
+                with psycopg.connect(
+                    host=data["host"], port=data["port"], dbname=data["database_name"],
+                    user=data["username"], password=data["password"], connect_timeout=5,
+                ) as connection:
+                    connection.execute("SELECT 1")
+            except ImportError:
+                import psycopg2
+                connection = psycopg2.connect(
+                    host=data["host"], port=data["port"], dbname=data["database_name"],
+                    user=data["username"], password=data["password"], connect_timeout=5,
+                )
+                connection.close()
+        elif engine in {"mysql", "mariadb"}:
+            if engine == "mysql":
+                import pymysql
+                connection = pymysql.connect(
+                    host=data["host"], port=data["port"], database=data["database_name"],
+                    user=data["username"], password=data["password"], connect_timeout=5,
+                )
+            else:
+                import mariadb
+                connection = mariadb.connect(
+                    host=data["host"], port=data["port"], database=data["database_name"],
+                    user=data["username"], password=data["password"], connect_timeout=5,
+                )
+            connection.close()
+        elif engine == "sql server":
+            import pyodbc
+            connection = pyodbc.connect(
+                "DRIVER={ODBC Driver 18 for SQL Server};"
+                f"SERVER={data['host']},{data['port']};DATABASE={data['database_name']};"
+                f"UID={data['username']};PWD={data['password']};"
+                "Encrypt=yes;TrustServerCertificate=yes;Connection Timeout=5;"
+            )
+            connection.close()
+        elif engine == "mongodb":
+            from pymongo import MongoClient
+            client = MongoClient(
+                host=data["host"], port=data["port"], username=data["username"],
+                password=data["password"], serverSelectionTimeoutMS=5000,
+            )
+            client.admin.command("ping")
+            client.close()
+        else:
+            return False, f"Unsupported database engine: {data['engine']}"
+    except ImportError as error:
+        return False, f"Driver is not installed for {data['engine']}: {error.name}"
+    except Exception as error:  # database drivers expose different exception types
+        return False, str(error)[:240] or "Connection failed."
+    return True, "Connection verified successfully."
+
+
+def setting_value(key: str, default: str = "") -> str:
+    row = get_db().execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
 
 
 def form_payload() -> dict:
@@ -207,9 +298,16 @@ def dashboard():
 @app.route("/jobs")
 def jobs():
     db = get_db()
-    jobs = db.execute("""SELECT jobs.*, connections.name AS connection_name, connections.engine, connections.database_name
-                        FROM jobs JOIN connections ON connections.id = jobs.connection_id ORDER BY jobs.id DESC""").fetchall()
-    return render_template("jobs.html", active="Jobs", jobs=jobs)
+    filter_type = request.args.get("filter", "all")
+    query = """SELECT jobs.*, connections.name AS connection_name, connections.engine, connections.database_name
+                FROM jobs JOIN connections ON connections.id = jobs.connection_id"""
+    params = []
+    if filter_type in {"backup", "archive", "retention"}:
+        query += " WHERE jobs.job_type = ?"
+        params.append(filter_type)
+    query += " ORDER BY jobs.id DESC"
+    jobs = db.execute(query, params).fetchall()
+    return render_template("jobs.html", active="Jobs", jobs=jobs, filter_type=filter_type)
 
 
 @app.route("/jobs/new", methods=["GET", "POST"])
@@ -296,6 +394,28 @@ def delete_connection(connection_id: int):
     return redirect(url_for("connections"))
 
 
+@app.route("/connections/<int:connection_id>/edit", methods=["GET", "POST"])
+def edit_connection(connection_id: int):
+    db = get_db()
+    connection = db.execute("SELECT * FROM connections WHERE id = ?", (connection_id,)).fetchone()
+    if connection is None:
+        return redirect(url_for("connections"))
+    if request.method == "POST":
+        source = connection_fields(request.form)
+        if not source["name"] or not source["host"] or not source["database_name"] or not source["username"]:
+            flash("Name, host, database and username are required.", "error")
+        else:
+            password = source["password"] or connection["password"]
+            db.execute("""UPDATE connections SET name = ?, engine = ?, host = ?, port = ?,
+                         database_name = ?, username = ?, password = ?, ssl_mode = ? WHERE id = ?""",
+                       (source["name"], source["engine"], source["host"], source["port"], source["database_name"], source["username"], password, source["ssl_mode"], connection_id))
+            db.commit()
+            log_activity("Connection updated", f"{source['name']} · configuration saved", "blue")
+            flash("Database connection updated.", "success")
+            return redirect(url_for("connections"))
+    return render_template("connection_form.html", active="Connections", connection=connection, form=request.form if request.method == "POST" else dict(connection))
+
+
 @app.route("/retention")
 def retention():
     db = get_db()
@@ -313,7 +433,13 @@ def activity():
 
 @app.route("/settings")
 def settings():
-    return render_template("settings.html", active="Settings")
+    return render_template(
+        "settings.html",
+        active="Settings",
+        r2_account_id=setting_value("r2_account_id"),
+        r2_bucket=setting_value("r2_bucket"),
+        r2_endpoint=setting_value("r2_endpoint"),
+    )
 
 
 @app.get("/api/health")
@@ -346,6 +472,110 @@ def api_connections():
                               username, ssl_mode, created_at
                               FROM connections ORDER BY id DESC""").fetchall()
     return jsonify([dict(row) for row in rows])
+
+
+@app.post("/api/connections/test")
+def api_test_unsaved_connection():
+    source = request.get_json(silent=True) or request.form.to_dict()
+    ok, message = test_database_connection(source)
+    return jsonify({"ok": ok, "message": message}), (200 if ok else 422)
+
+
+@app.post("/api/connections/<int:connection_id>/test")
+def api_test_saved_connection(connection_id: int):
+    connection = get_db().execute("SELECT * FROM connections WHERE id = ?", (connection_id,)).fetchone()
+    if connection is None:
+        return jsonify({"ok": False, "message": "Connection not found."}), 404
+    ok, message = test_database_connection(dict(connection))
+    if ok:
+        log_activity("Connection verified", f"{connection['name']} · {connection['engine']}", "teal")
+    return jsonify({"ok": ok, "message": message, "connection_id": connection_id}), (200 if ok else 422)
+
+
+@app.get("/api/search")
+def api_search():
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"jobs": [], "connections": []})
+    like = f"%{query}%"
+    db = get_db()
+    jobs = db.execute("""SELECT jobs.id, jobs.name, jobs.job_type, connections.name AS connection_name
+                         FROM jobs JOIN connections ON connections.id = jobs.connection_id
+                         WHERE jobs.name LIKE ? OR connections.name LIKE ?
+                         ORDER BY jobs.id DESC LIMIT 10""", (like, like)).fetchall()
+    connections = db.execute("""SELECT id, name, engine, database_name
+                               FROM connections WHERE name LIKE ? OR host LIKE ? OR database_name LIKE ?
+                               ORDER BY id DESC LIMIT 10""", (like, like, like)).fetchall()
+    return jsonify({"jobs": [dict(row) for row in jobs], "connections": [dict(row) for row in connections]})
+
+
+@app.get("/api/metrics")
+def api_metrics():
+    db = get_db()
+    return jsonify({
+        "protected_databases": db.execute("SELECT COUNT(*) FROM connections").fetchone()[0],
+        "scheduled_jobs": db.execute("SELECT COUNT(*) FROM jobs WHERE enabled = 1").fetchone()[0],
+        "stored_r2_bytes": 0,
+        "reclaimed_bytes": 0,
+        "executions": 0,
+    })
+
+
+@app.get("/api/export/report")
+def api_export_report():
+    db = get_db()
+    rows = db.execute("""SELECT jobs.name, jobs.job_type, connections.name AS connection,
+                        connections.engine, jobs.cadence, jobs.run_date, jobs.run_time,
+                        jobs.cron_expression, jobs.enabled
+                        FROM jobs JOIN connections ON connections.id = jobs.connection_id
+                        ORDER BY jobs.id DESC""").fetchall()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["job_name", "job_type", "connection", "engine", "cadence", "run_date", "run_time", "cron_expression", "enabled"])
+    writer.writerows([tuple(row) for row in rows])
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=vaultline-report.csv"},
+    )
+
+
+@app.post("/api/retention/dry-run")
+def api_retention_dry_run():
+    rows = get_db().execute("""SELECT jobs.id, jobs.name, jobs.job_type, jobs.retention_days,
+                              jobs.tables_scope, jobs.selected_tables, connections.name AS connection_name
+                              FROM jobs JOIN connections ON connections.id = jobs.connection_id
+                              WHERE jobs.job_type IN ('retention', 'archive')
+                              ORDER BY jobs.id DESC""").fetchall()
+    policies = []
+    for row in rows:
+        policies.append({
+            "id": row["id"], "name": row["name"], "connection": row["connection_name"],
+            "tables_scope": row["tables_scope"], "selected_tables": row["selected_tables"],
+            "retention_days": row["retention_days"], "estimated_rows": 0,
+            "message": "Preview only: no source rows or R2 objects were changed.",
+        })
+    log_activity("Retention dry run completed", f"{len(policies)} policies previewed", "blue")
+    return jsonify({"ok": True, "policies": policies, "message": f"{len(policies)} retention policies previewed."})
+
+
+@app.get("/api/settings/sqlite-backup")
+def api_sqlite_backup():
+    get_db().commit()
+    return send_file(app.config["DATABASE"], as_attachment=True, download_name="vaultline.db", mimetype="application/octet-stream")
+
+
+@app.route("/api/settings/r2", methods=["GET", "POST"])
+def api_r2_settings():
+    db = get_db()
+    keys = ("r2_account_id", "r2_bucket", "r2_endpoint")
+    if request.method == "POST":
+        source = request.get_json(silent=True) or request.form
+        for key in keys:
+            db.execute("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP", (key, (source.get(key) or "").strip()))
+        db.commit()
+        log_activity("R2 settings updated", source.get("r2_bucket") or "Default R2 target", "blue")
+    return jsonify({key: setting_value(key) for key in keys})
 
 
 if __name__ == "__main__":
