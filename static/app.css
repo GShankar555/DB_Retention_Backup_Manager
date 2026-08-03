@@ -14,3 +14,4 @@
 @media(max-width:900px){.run-action-label{display:none}.job-actions{min-width:128px}.jobs-table-card table{min-width:760px}}
 body{font-size:14px}.subtitle{font-size:13px}.button{font-size:12px}.button.small{font-size:11px}.card-heading p,.form-hint,.operation-description{font-size:11px}
 .button.primary.run-job{color:#fff!important}
+.job-layout{width:100%;max-width:100%;min-width:0}.job-main,.job-side,.job-layout .form-card,.job-layout .form-grid{min-width:0;max-width:100%}.job-layout .form-grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.job-layout input,.job-layout select,.job-layout textarea{min-width:0;max-width:100%}body{overflow-x:hidden}
