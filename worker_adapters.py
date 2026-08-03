@@ -337,6 +337,16 @@ def cursor_rows(cursor) -> list[dict[str, Any]]:
     return [dict(zip(names, row)) for row in rows]
 
 
+def rows_from_values(cursor, values: list[Any]) -> list[dict[str, Any]]:
+    """Normalize a fetched batch without asking the driver for every row again."""
+    if not values:
+        return []
+    if isinstance(values[0], dict):
+        return [dict(row) for row in values]
+    names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row)) for row in values]
+
+
 def sql_placeholder(engine: str) -> str:
     return "?" if engine in {"sqlserver", "mssql"} else "%s"
 
@@ -426,6 +436,90 @@ def write_archive(rows: list[dict[str, Any]], path: Path, archive_format: str) -
     raise AdapterError(f"Unsupported archive format: {archive_format}")
 
 
+ARCHIVE_BATCH_SIZE = 1000
+
+
+def streaming_cursor(connection, engine: str, name: str):
+    """Return a cursor that avoids buffering the complete source table."""
+    if engine == "postgresql":
+        # A named psycopg cursor streams rows from PostgreSQL instead of keeping
+        # the complete result set in the worker process.
+        return connection.cursor(name=name)
+    if engine in {"mysql", "mariadb"}:
+        try:
+            import pymysql
+            return connection.cursor(pymysql.cursors.SSCursor)
+        except ImportError:
+            pass
+    cursor = connection.cursor()
+    cursor.arraysize = ARCHIVE_BATCH_SIZE
+    return cursor
+
+
+def stream_archive_rows(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, path: Path) -> tuple[str, int]:
+    """Write an archive in bounded batches and return its MIME type and count."""
+    engine = engine_name(job)
+    reference = table_reference(engine, schema, table)
+    cursor = streaming_cursor(connection, engine, f"vaultline_archive_{slug(table)}")
+    cursor.execute(
+        f"SELECT * FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+        (cutoff,),
+    )
+    archive_format = (str(field(job, "archive_format", "Parquet")) or "Parquet").lower()
+    total_rows = 0
+    first_batch = rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))
+    if not first_batch:
+        cursor.close()
+        return ({"parquet": "application/vnd.apache.parquet", "csv": "text/csv", "jsonl": "application/x-ndjson"}.get(archive_format, "application/octet-stream"), 0)
+
+    if archive_format == "parquet":
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as parquet
+        except ImportError as error:
+            cursor.close()
+            raise AdapterError("Parquet archive requires pyarrow from requirements.txt.") from error
+        schema = pa.Table.from_pylist(first_batch).schema
+        writer = parquet.ParquetWriter(path, schema, compression="zstd")
+        try:
+            batch = first_batch
+            while batch:
+                writer.write_table(pa.Table.from_pylist(batch, schema=schema))
+                total_rows += len(batch)
+                batch = rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))
+        finally:
+            writer.close()
+            cursor.close()
+        return "application/vnd.apache.parquet", total_rows
+
+    if archive_format == "csv":
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(first_batch[0]))
+            writer.writeheader()
+            batch = first_batch
+            while batch:
+                for row in batch:
+                    writer.writerow({key: "" if value is None else str(value) for key, value in row.items()})
+                total_rows += len(batch)
+                batch = rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))
+        cursor.close()
+        return "text/csv", total_rows
+
+    if archive_format == "jsonl":
+        with path.open("w", encoding="utf-8") as handle:
+            batch = first_batch
+            while batch:
+                for row in batch:
+                    handle.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
+                total_rows += len(batch)
+                batch = rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))
+        cursor.close()
+        return "application/x-ndjson", total_rows
+
+    cursor.close()
+    raise AdapterError(f"Unsupported archive format: {archive_format}")
+
+
 def document_value(value: Any) -> Any:
     """Make BSON values stable for Parquet/JSON serialization."""
     if value is None or isinstance(value, (str, int, float, bool, dt.date, dt.datetime)):
@@ -499,6 +593,27 @@ def old_rows(connection, job: Any, schema: str | None, table: str, column: str |
     return column, cursor_rows(cursor), cutoff
 
 
+def count_old_rows(connection, job: Any, schema: str | None, table: str, column: str | None = None) -> tuple[str, int, Any]:
+    """Count eligible rows without materializing them in Python memory."""
+    engine = engine_name(job)
+    reference = table_reference(engine, schema, table)
+    column = column or age_column(connection, job, schema, table)
+    if not column:
+        raise AdapterError(f"No configured age column was found on {reference}.")
+    days = int(field(job, "retention_days", 730) or 730)
+    if days < 1:
+        raise AdapterError("Retention window must be at least one day.")
+    cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
+    cursor = connection.cursor()
+    cursor.execute(
+        f"SELECT COUNT(*) AS row_count FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+        (cutoff,),
+    )
+    row = cursor_rows(cursor)[0]
+    count = next((value for key, value in row.items() if str(key).lower() in {"row_count", "count(*)"}), next(iter(row.values())))
+    return column, int(count or 0), cutoff
+
+
 def preview_row_job(job: Any) -> list[dict[str, Any]]:
     """Count eligible rows using the same scope and age rules as live jobs."""
     if engine_name(job) == "mongodb":
@@ -563,27 +678,40 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
         if not prepared:
             return results
         for schema, table, column in prepared:
-            column, rows, cutoff = old_rows(connection, job, schema, table, column)
             reference = table_reference(engine, schema, table)
-            if not rows:
+            if not archive:
+                # Retention does not need row contents. Counting and deleting in
+                # the database keeps a large cleanup bounded in worker memory.
+                column, eligible, cutoff = count_old_rows(connection, job, schema, table, column)
+                cursor = connection.cursor()
+                cursor.execute(
+                    f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+                    (cutoff,),
+                )
+                deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else eligible
+                connection.commit()
+                results.append({"table": reference, "rows": eligible, "deleted": deleted, "age_column": column, "cutoff": cutoff})
+                continue
+
+            extension = (str(field(job, "archive_format", "Parquet")) or "Parquet").lower()
+            path = temp_dir / f"{slug((schema + '.' if schema else '') + table)}.{extension}"
+            column, eligible, cutoff = count_old_rows(connection, job, schema, table, column)
+            if not eligible:
                 results.append({"table": reference, "rows": 0, "deleted": 0})
                 continue
-            if archive:
-                extension = (str(field(job, "archive_format", "Parquet")) or "Parquet").lower()
-                path = temp_dir / f"{slug((schema + '.' if schema else '') + table)}.{extension}"
-                content_type = write_archive(rows, path, str(field(job, "archive_format", "Parquet")))
-                key = object_key(job, run_id, path.name)
-                uploaded = upload_to_r2(job, path, key, content_type)
-                uploaded.update({"format": extension, "table": reference, "rows": len(rows), "age_column": column, "cutoff": cutoff})
-                results.append(uploaded)
+            content_type, streamed = stream_archive_rows(connection, job, schema, table, column, cutoff, path)
+            key = object_key(job, run_id, path.name)
+            uploaded = upload_to_r2(job, path, key, content_type)
+            uploaded.update({"format": extension, "table": reference, "rows": streamed, "age_column": column, "cutoff": cutoff})
+            results.append(uploaded)
             cursor = connection.cursor()
-            cursor.execute(f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}", (cutoff,))
-            deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else len(rows)
+            cursor.execute(
+                f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+                (cutoff,),
+            )
+            deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else streamed
             connection.commit()
-            if archive:
-                results[-1]["deleted"] = deleted
-            else:
-                results.append({"table": reference, "rows": len(rows), "deleted": deleted, "age_column": column, "cutoff": cutoff})
+            results[-1]["deleted"] = deleted
     except Exception:
         try:
             connection.rollback()

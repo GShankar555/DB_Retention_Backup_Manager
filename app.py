@@ -686,11 +686,17 @@ def api_run_job(job_id: int):
     running = db.execute("SELECT id FROM job_runs WHERE job_id = ? AND status = 'running'", (job_id,)).fetchone()
     if running:
         return jsonify({"ok": False, "message": "This job is already running.", "run_id": running["id"]}), 409
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_handle = (LOG_DIR / f"job-{job_id}.log").open("ab")
+    except OSError as error:
+        return jsonify({"ok": False, "message": f"Worker log could not be opened: {error}"}), 503
     process = subprocess.Popen(
         [sys.executable, str(WORKER_SCRIPT), "--job-id", str(job_id)],
-        cwd=str(BASE_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=str(BASE_DIR), stdout=log_handle, stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    log_handle.close()
     return jsonify({"ok": True, "message": f"{job['name']} queued.", "process_id": process.pid}), 202
 
 
