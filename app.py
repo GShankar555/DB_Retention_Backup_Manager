@@ -14,6 +14,7 @@ from flask import Flask, Response, flash, g, jsonify, redirect, render_template,
 BASE_DIR = Path(__file__).resolve().parent
 INSTANCE_DIR = BASE_DIR / "instance"
 DATABASE = Path(os.getenv("VAULTLINE_DB", INSTANCE_DIR / "vaultline.db"))
+CRON_FILE = Path(os.getenv("VAULTLINE_CRON_FILE", "/etc/cron.d/vaultline"))
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("VAULTLINE_SECRET", "change-this-in-production")
@@ -200,6 +201,15 @@ def setting_value(key: str, default: str = "") -> str:
     return row["value"] if row else default
 
 
+def scheduler_info() -> dict:
+    installed = CRON_FILE.exists()
+    return {
+        "installed": installed,
+        "label": "Installed" if installed else "Not installed",
+        "path": str(CRON_FILE),
+    }
+
+
 def form_payload() -> dict:
     cadence = request.form.get("cadence", "Daily")
     run_date = request.form.get("run_date", datetime.now().strftime("%Y-%m-%d"))
@@ -235,6 +245,7 @@ def inject_globals():
             "Connections": db.execute("SELECT COUNT(*) FROM connections").fetchone()[0],
         },
         "logged_in_user": session.get("username"),
+        "scheduler_status": scheduler_info(),
     }
 
 
@@ -439,6 +450,7 @@ def settings():
         r2_account_id=setting_value("r2_account_id"),
         r2_bucket=setting_value("r2_bucket"),
         r2_endpoint=setting_value("r2_endpoint"),
+        scheduler=scheduler_info(),
     )
 
 
@@ -452,6 +464,7 @@ def api_health():
         "database": "sqlite",
         "jobs": db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
         "connections": db.execute("SELECT COUNT(*) FROM connections").fetchone()[0],
+        "scheduler": scheduler_info(),
     })
 
 
@@ -518,7 +531,13 @@ def api_metrics():
         "stored_r2_bytes": 0,
         "reclaimed_bytes": 0,
         "executions": 0,
+        "scheduler": scheduler_info(),
     })
+
+
+@app.get("/api/system/scheduler")
+def api_scheduler_status():
+    return jsonify(scheduler_info())
 
 
 @app.get("/api/export/report")
