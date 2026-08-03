@@ -53,6 +53,28 @@ def slug(value: str, fallback: str = "job") -> str:
     return cleaned[:80] or fallback
 
 
+def locate_tool(name: str, environment_key: str | None = None) -> str | None:
+    """Find native tools even when cron does not load the login-shell PATH."""
+    configured = os.getenv(environment_key, "").strip() if environment_key else ""
+    candidates = [configured] if configured else []
+    found = shutil.which(name)
+    if found:
+        candidates.append(found)
+    candidates.extend([f"/usr/bin/{name}", f"/usr/local/bin/{name}"])
+    postgres_root = Path("/usr/lib/postgresql")
+    if postgres_root.is_dir():
+        candidates.extend(str(version / "bin" / name) for version in postgres_root.iterdir())
+    candidates.extend(
+        f"/usr/{version}/bin/{name}"
+        for version in os.listdir("/usr")
+        if version.startswith("pgsql-")
+    )
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def object_key(job: Any, run_id: int, filename: str) -> str:
     source = slug(str(field(job, "connection_name", "database")))
     name = slug(str(field(job, "name", "job")))
@@ -125,9 +147,9 @@ def create_native_backup(job: Any, destination: Path) -> tuple[str, str]:
     engine = engine_name(job)
     env = os.environ.copy()
     if engine == "postgresql":
-        utility = shutil.which("pg_dump")
+        utility = locate_tool("pg_dump", "VAULTLINE_PG_DUMP")
         if not utility:
-            raise AdapterError("PostgreSQL backup requires pg_dump on the Linode VM.")
+            raise AdapterError("PostgreSQL backup requires pg_dump; set VAULTLINE_PG_DUMP to its absolute path if cron cannot find it.")
         env["PGPASSWORD"] = str(values["password"])
         command = [
             utility, "--host", str(values["host"]), "--port", str(values["port"]),
@@ -138,7 +160,7 @@ def create_native_backup(job: Any, destination: Path) -> tuple[str, str]:
         run_command(command, destination, env)
         return destination.name, "application/octet-stream"
     if engine in {"mysql", "mariadb"}:
-        utility = shutil.which("mariadb-dump") or shutil.which("mysqldump")
+        utility = locate_tool("mariadb-dump", "VAULTLINE_MARIADB_DUMP") or locate_tool("mysqldump", "VAULTLINE_MYSQLDUMP")
         if not utility:
             raise AdapterError("MySQL/MariaDB backup requires mysqldump or mariadb-dump on the Linode VM.")
         env["MYSQL_PWD"] = str(values["password"])
@@ -150,7 +172,7 @@ def create_native_backup(job: Any, destination: Path) -> tuple[str, str]:
         run_command(command, destination, env)
         return destination.name, "application/sql"
     if engine == "mongodb":
-        utility = shutil.which("mongodump")
+        utility = locate_tool("mongodump", "VAULTLINE_MONGODUMP")
         if not utility:
             raise AdapterError("MongoDB backup requires mongodump on the Linode VM.")
         command = [
