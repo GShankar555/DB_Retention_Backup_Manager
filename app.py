@@ -234,18 +234,11 @@ def test_database_connection(source: dict) -> tuple[bool, str]:
                 )
                 connection.close()
         elif engine in {"mysql", "mariadb"}:
-            if engine == "mysql":
-                import pymysql
-                connection = pymysql.connect(
-                    host=data["host"], port=data["port"], database=data["database_name"],
-                    user=data["username"], password=data["password"], connect_timeout=5,
-                )
-            else:
-                import mariadb
-                connection = mariadb.connect(
-                    host=data["host"], port=data["port"], database=data["database_name"],
-                    user=data["username"], password=data["password"], connect_timeout=5,
-                )
+            import pymysql
+            connection = pymysql.connect(
+                host=data["host"], port=data["port"], database=data["database_name"],
+                user=data["username"], password=data["password"], connect_timeout=5,
+            )
             connection.close()
         elif engine == "sql server":
             import pyodbc

@@ -34,7 +34,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-The connection tester uses `psycopg` for PostgreSQL, `PyMySQL` for MySQL/MariaDB, and `pymongo` for MongoDB. SQL Server testing and row operations require `pyodbc` plus Microsoft ODBC Driver 18. Full native backups additionally require `pg_dump`, `mysqldump`/`mariadb-dump`, or `mongodump` on the Linode VM.
+The connection tester and row adapter use `psycopg` for PostgreSQL, `PyMySQL` for MySQL/MariaDB, and `pymongo` for MongoDB. SQL Server testing and row operations require `pyodbc` plus Microsoft ODBC Driver 18. Full native backups additionally require `pg_dump`, `mysqldump`/`mariadb-dump`, or `mongodump` on the Linode VM.
 
 On Ubuntu/Debian, install the common native tools before creating live backup jobs:
 
