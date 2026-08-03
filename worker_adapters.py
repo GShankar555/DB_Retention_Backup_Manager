@@ -151,11 +151,11 @@ def create_native_backup(job: Any, destination: Path) -> tuple[str, str]:
         if not utility:
             raise AdapterError("PostgreSQL backup requires pg_dump; set VAULTLINE_PG_DUMP to its absolute path if cron cannot find it.")
         env["PGPASSWORD"] = str(values["password"])
+        env["PGSSLMODE"] = str(values["ssl_mode"])
         command = [
             utility, "--host", str(values["host"]), "--port", str(values["port"]),
             "--username", str(values["username"]), "--dbname", str(values["database"]),
             "--format=custom", "--no-owner", "--no-acl", "--file", str(destination),
-            "--sslmode", str(values["ssl_mode"]),
         ]
         run_command(command, destination, env)
         return destination.name, "application/octet-stream"
