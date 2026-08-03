@@ -11,7 +11,7 @@ Flask-first control plane for universal database backups, retention and archive 
 - Daily, weekly, biweekly and monthly schedules, with date/time/timezone fields and generated cron expressions. Each generated entry includes `CRON_TZ`, so a 23:00 Asia/Kolkata job stays at 23:00 IST even when the VM uses UTC.
 - Direct cron override for advanced operators.
 - CRUD flows for jobs and connections, with destructive action confirmation.
-- Dry-run protection and an activity/audit view.
+- Dry-run protection, verified R2 uploads, object ledger metrics, deleted-row counts and an activity/audit view.
 - Simple session authentication with the provided administrator credentials.
 - Authenticated JSON endpoints: `/api/health`, `/api/jobs`, and `/api/connections`.
 - Working control APIs for connection testing, search, CSV export, retention dry runs, SQLite backup, R2 settings and metrics.
@@ -22,7 +22,7 @@ Flask-first control plane for universal database backups, retention and archive 
 1. **Connect:** validate source credentials with the selected database adapter and keep secrets encrypted on the Linode VM.
 2. **Preview:** query row counts, table scope and estimated bytes. Require approval for destructive jobs unless dry-run is selected.
 3. **Schedule:** job create/update/delete rewrites `/etc/cron.d/vaultline` with the saved cron expression, `CRON_TZ` and worker command. Click **Settings → Sync now** after deploying scheduler changes. Set `VAULTLINE_CRON_FILE`, `VAULTLINE_CRON_USER`, and `VAULTLINE_WORKER` when the deployment uses different paths or users.
-4. **Execute:** stream native backups or table batches to R2 using its S3-compatible API. Archive jobs should write Parquet parts with a stable schema and metadata manifest.
+4. **Execute:** native PostgreSQL, MySQL/MariaDB and MongoDB backups are uploaded to R2 through its S3-compatible API. Retention and archive jobs support PostgreSQL, MySQL/MariaDB, SQL Server and MongoDB table/collection scope; archive jobs write Parquet, CSV or JSONL before deletion.
 5. **Verify:** check object existence, size and checksum before deleting source rows. The worker run ledger now stores useful milestone status/progress events; write each stage to it and mark the job result.
 
 ## Run locally
@@ -34,7 +34,16 @@ pip install -r requirements.txt
 python app.py
 ```
 
-The connection tester uses `psycopg` for PostgreSQL, `PyMySQL` for MySQL/MariaDB, and `pymongo` for MongoDB. SQL Server testing requires `pyodbc` plus Microsoft ODBC Driver 18 to be installed on the Linode VM.
+The connection tester uses `psycopg` for PostgreSQL, `PyMySQL` for MySQL/MariaDB, and `pymongo` for MongoDB. SQL Server testing and row operations require `pyodbc` plus Microsoft ODBC Driver 18. Full native backups additionally require `pg_dump`, `mysqldump`/`mariadb-dump`, or `mongodump` on the Linode VM.
+
+On Ubuntu/Debian, install the common native tools before creating live backup jobs:
+
+```bash
+apt-get update
+apt-get install -y postgresql-client default-mysql-client
+```
+
+Install MongoDB Database Tools separately when MongoDB backups are needed. After deployment, run `pip install -r requirements.txt`, restart Gunicorn, configure the R2 credentials on the job, test the source connection, run a dry run, then disable dry run for the live job.
 
 Open `http://localhost:5000`. The SQLite database is created at `instance/vaultline.db` unless `VAULTLINE_DB` is set.
 
@@ -42,4 +51,4 @@ For deployment, override them with `VAULTLINE_ADMIN_USERNAME`, `VAULTLINE_ADMIN_
 
 ## Linode deployment shape
 
-Use Gunicorn behind Nginx, keep `VAULTLINE_SECRET` in an environment file, and run `worker.py` plus cron under a restricted service account. The current worker provides safe dry-run execution and run logging; database export, Parquet conversion, R2 upload, checksum verification and purge execution are the next adapter layer.
+Use Gunicorn behind Nginx, keep `VAULTLINE_SECRET` in an environment file, and run `worker.py` plus cron under a restricted service account. Install the OS-level backup tools before disabling dry run. The worker verifies uploaded object size before any archive/retention delete is committed. SQL Server jobs use a compressed logical table export because native `.bak` files must be written on the SQL Server host.

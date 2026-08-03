@@ -14,6 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, Response, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
+from worker_adapters import preview_row_job
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -78,6 +79,7 @@ def init_db() -> None:
             timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata',
             cron_expression TEXT NOT NULL,
             retention_days INTEGER,
+            retention_column TEXT NOT NULL DEFAULT 'created_at',
             tables_scope TEXT NOT NULL DEFAULT 'all',
             selected_tables TEXT,
             archive_format TEXT DEFAULT 'Parquet',
@@ -104,6 +106,8 @@ def init_db() -> None:
             status TEXT NOT NULL,
             progress INTEGER NOT NULL DEFAULT 0,
             message TEXT NOT NULL DEFAULT '',
+            rows_processed INTEGER NOT NULL DEFAULT 0,
+            rows_deleted INTEGER NOT NULL DEFAULT 0,
             started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             finished_at TEXT,
             FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
@@ -118,8 +122,29 @@ def init_db() -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (run_id) REFERENCES job_runs(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS r2_objects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            job_id INTEGER NOT NULL,
+            bucket TEXT NOT NULL,
+            object_key TEXT NOT NULL,
+            format TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            etag TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (run_id) REFERENCES job_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
         """
     )
+    columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "retention_column" not in columns:
+        db.execute("ALTER TABLE jobs ADD COLUMN retention_column TEXT NOT NULL DEFAULT 'created_at'")
+    run_columns = {row[1] for row in db.execute("PRAGMA table_info(job_runs)").fetchall()}
+    if "rows_processed" not in run_columns:
+        db.execute("ALTER TABLE job_runs ADD COLUMN rows_processed INTEGER NOT NULL DEFAULT 0")
+    if "rows_deleted" not in run_columns:
+        db.execute("ALTER TABLE job_runs ADD COLUMN rows_deleted INTEGER NOT NULL DEFAULT 0")
     db.commit()
 
 
@@ -158,6 +183,15 @@ def log_activity(title: str, detail: str, tone: str = "teal") -> None:
     db = get_db()
     db.execute("INSERT INTO activity (title, detail, tone) VALUES (?, ?, ?)", (title, detail, tone))
     db.commit()
+
+
+def human_bytes(value: int | float | None) -> str:
+    size = float(value or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return "0 B"
 
 
 def connection_fields(source: dict) -> dict:
@@ -333,6 +367,7 @@ def form_payload() -> dict:
         "timezone": valid_timezone(request.form.get("timezone", "Asia/Kolkata")),
         "cron_expression": request.form.get("cron_expression", "").strip() or build_cron(cadence, run_date, run_time),
         "retention_days": request.form.get("retention_days", type=int),
+        "retention_column": request.form.get("retention_column", "created_at").strip() or "created_at",
         "tables_scope": request.form.get("tables_scope", "all"),
         "selected_tables": request.form.get("selected_tables", "").strip(),
         "archive_format": request.form.get("archive_format", "Parquet"),
@@ -351,6 +386,7 @@ def inject_globals():
         },
         "logged_in_user": session.get("username"),
         "scheduler_status": scheduler_info(),
+        "human_bytes": human_bytes,
     }
 
 
@@ -398,6 +434,11 @@ def dashboard():
     connections = db.execute("SELECT * FROM connections ORDER BY id").fetchall()
     activities = db.execute("SELECT * FROM activity ORDER BY id DESC LIMIT 5").fetchall()
     next_job = jobs[0] if jobs else None
+    metrics = {
+        "stored_r2_bytes": db.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM r2_objects").fetchone()[0],
+        "executions": db.execute("SELECT COUNT(*) FROM job_runs WHERE status = 'success'").fetchone()[0],
+        "rows_deleted": db.execute("SELECT COALESCE(SUM(rows_deleted), 0) FROM job_runs").fetchone()[0],
+    }
     return render_template(
         "dashboard.html",
         active="Overview",
@@ -406,6 +447,7 @@ def dashboard():
         activities=activities,
         protected_count=len(connections),
         next_job=next_job,
+        metrics=metrics,
     )
 
 
@@ -440,7 +482,11 @@ def new_job():
             log_activity("New job created", f"{payload['name']} · {cron_message}", "teal" if cron_ok else "amber")
             flash("Job created and system cron updated." if cron_ok else f"Job saved, but cron update failed: {cron_message}", "success" if cron_ok else "error")
             return redirect(url_for("jobs"))
-    return render_template("job_form.html", active="Jobs", connections=connections, job=None, form=request.form)
+    form = request.form if request.method == "POST" else {
+        "r2_account_id": setting_value("r2_account_id"),
+        "r2_bucket": setting_value("r2_bucket") or "vaultline-prod",
+    }
+    return render_template("job_form.html", active="Jobs", connections=connections, job=None, form=form)
 
 
 @app.route("/jobs/<int:job_id>/edit", methods=["GET", "POST"])
@@ -689,9 +735,10 @@ def api_metrics():
     return jsonify({
         "protected_databases": db.execute("SELECT COUNT(*) FROM connections").fetchone()[0],
         "scheduled_jobs": db.execute("SELECT COUNT(*) FROM jobs WHERE enabled = 1").fetchone()[0],
-        "stored_r2_bytes": 0,
-        "reclaimed_bytes": 0,
-        "executions": 0,
+        "stored_r2_bytes": db.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM r2_objects").fetchone()[0],
+        "reclaimed_bytes": None,
+        "rows_deleted": db.execute("SELECT COALESCE(SUM(rows_deleted), 0) FROM job_runs").fetchone()[0],
+        "executions": db.execute("SELECT COUNT(*) FROM job_runs WHERE status = 'success'").fetchone()[0],
         "scheduler": scheduler_info(),
     })
 
@@ -728,19 +775,30 @@ def api_export_report():
 
 @app.post("/api/retention/dry-run")
 def api_retention_dry_run():
-    rows = get_db().execute("""SELECT jobs.id, jobs.name, jobs.job_type, jobs.retention_days,
-                              jobs.tables_scope, jobs.selected_tables, connections.name AS connection_name
+    rows = get_db().execute("""SELECT jobs.*, connections.name AS connection_name,
+                              connections.engine, connections.database_name,
+                              connections.host, connections.port, connections.username,
+                              connections.password, connections.ssl_mode
                               FROM jobs JOIN connections ON connections.id = jobs.connection_id
                               WHERE jobs.job_type IN ('retention', 'archive')
                               ORDER BY jobs.id DESC""").fetchall()
     policies = []
     for row in rows:
-        policies.append({
+        item = {
             "id": row["id"], "name": row["name"], "connection": row["connection_name"],
             "tables_scope": row["tables_scope"], "selected_tables": row["selected_tables"],
             "retention_days": row["retention_days"], "estimated_rows": 0,
-            "message": "Preview only: no source rows or R2 objects were changed.",
-        })
+        }
+        try:
+            preview = preview_row_job(row)
+            item["tables"] = preview
+            item["estimated_rows"] = sum(int(table["rows"]) for table in preview)
+            item["message"] = "Preview only: no source rows or R2 objects were changed."
+        except Exception as error:
+            item["tables"] = []
+            item["message"] = str(error)[:240]
+            item["error"] = True
+        policies.append(item)
     log_activity("Retention dry run completed", f"{len(policies)} policies previewed", "blue")
     return jsonify({"ok": True, "policies": policies, "message": f"{len(policies)} retention policies previewed."})
 

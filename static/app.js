@@ -152,7 +152,7 @@ document.addEventListener('DOMContentLoaded', () => {
       } catch (error) {
         toast(error.message, 'error');
         button.disabled = false;
-        button.innerHTML = '▶';
+        button.innerHTML = button.classList.contains('run-action') ? '<span class="run-action-icon">▶</span><span class="run-action-label">Run now</span>' : '▶';
       }
     });
   });
