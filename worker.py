@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -16,7 +18,7 @@ def event(run_id: int, status: str, progress: int, message: str, finish: bool = 
     db = get_db()
     finished_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") if finish else None
     db.execute(
-        "UPDATE job_runs SET status = ?, progress = ?, message = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
+        "UPDATE job_runs SET status = ?, progress = ?, message = ?, updated_at = CURRENT_TIMESTAMP, finished_at = COALESCE(?, finished_at) WHERE id = ?",
         (status, progress, message, finished_at, run_id),
     )
     # Only milestone messages are persisted; verbose adapter output belongs in worker files.
@@ -25,6 +27,25 @@ def event(run_id: int, status: str, progress: int, message: str, finish: bool = 
         (run_id, "error" if status == "failed" else "info", status, progress, message),
     )
     db.commit()
+
+
+def heartbeat(run_id: int, stop: threading.Event) -> None:
+    """Keep the run ledger honest while an adapter is inside a long DB call."""
+    while not stop.wait(10):
+        connection = None
+        try:
+            connection = sqlite3.connect(str(app.config["DATABASE"]), timeout=5)
+            connection.execute(
+                "UPDATE job_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'running'",
+                (run_id,),
+            )
+            connection.commit()
+        except sqlite3.Error:
+            # The next heartbeat or worker event can recover from a transient SQLite lock.
+            pass
+        finally:
+            if connection is not None:
+                connection.close()
 
 
 def run_job(job_id: int) -> int:
@@ -53,6 +74,9 @@ def run_job(job_id: int) -> int:
         )
         db.commit()
         run_id = cursor.lastrowid
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = threading.Thread(target=heartbeat, args=(run_id, heartbeat_stop), daemon=True)
+        heartbeat_thread.start()
         event(run_id, "running", 10, f"Started {job['name']} on {job['connection_name']}")
         try:
             if not job["engine"] or not job["database_name"]:
@@ -113,6 +137,9 @@ def run_job(job_id: int) -> int:
             event(run_id, "failed", 35, str(error), finish=True)
             print(str(error), file=sys.stderr)
             return 1
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=2)
 
 
 def main() -> int:

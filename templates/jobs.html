@@ -1,5 +1,6 @@
 {% extends 'base.html' %}
+{% from '_icons.html' import icon %}
 {% block content %}
-<div class="page-header"><div><p class="eyebrow"><i></i> SCHEDULED OPERATIONS</p><h1>Jobs</h1><p class="subtitle">Backups, archives and retention policies installed as system cron jobs.</p></div><div class="header-actions"><a class="button primary" href="{{ url_for('new_job') }}">+ &nbsp;New job</a></div></div>
+<div class="page-header"><div><p class="eyebrow"><i></i> SCHEDULED OPERATIONS</p><h1>Jobs</h1><p class="subtitle">Backups, archives and retention policies installed as system cron jobs.</p></div><div class="header-actions"><a class="button primary" href="{{ url_for('new_job') }}">{{ icon('plus', 14) }} New job</a></div></div>
 <section class="card table-card full-card jobs-table-card"><div class="card-heading table-heading"><div><h2>Scheduled jobs</h2><p>SQLite keeps the configuration local to your Linode VM.</p></div><form method="get" class="filter-form"><label><span>Filter</span><select name="filter" onchange="this.form.submit()"><option value="all" {% if filter_type == 'all' %}selected{% endif %}>All jobs</option><option value="backup" {% if filter_type == 'backup' %}selected{% endif %}>Backups</option><option value="archive" {% if filter_type == 'archive' %}selected{% endif %}>Archives</option><option value="retention" {% if filter_type == 'retention' %}selected{% endif %}>Retention</option></select></label></form></div>{% include '_jobs_table.html' %}</section>
 {% endblock %}

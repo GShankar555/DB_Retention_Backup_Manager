@@ -15,3 +15,94 @@
 body{font-size:14px}.subtitle{font-size:13px}.button{font-size:12px}.button.small{font-size:11px}.card-heading p,.form-hint,.operation-description{font-size:11px}
 .button.primary.run-job{color:#fff!important}
 .job-layout{width:100%;max-width:100%;min-width:0}.job-main,.job-side,.job-layout .form-card,.job-layout .form-grid{min-width:0;max-width:100%}.job-layout .form-grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.job-layout input,.job-layout select,.job-layout textarea{min-width:0;max-width:100%}body{overflow-x:hidden}
+
+/* Shared visual system */
+:root{
+  color-scheme: light;
+  --surface:#ffffff;
+  --surface-raised:#fbfdfc;
+  --surface-soft:#f2f7f6;
+  --surface-tint:#edf8f5;
+  --text-strong:#1a3941;
+  --text-body:#49666d;
+  --text-soft:#82999e;
+  --line-soft:#edf2f1;
+  --focus:#69b5a9;
+}
+html[data-theme="dark"]{
+  color-scheme: dark;
+  --bg:#0d1719;
+  --ink:#e8f4f1;
+  --muted:#8fa8aa;
+  --line:#294447;
+  --teal:#43b9a8;
+  --teal-light:#193e3b;
+  --surface:#132326;
+  --surface-raised:#102022;
+  --surface-soft:#1a3032;
+  --surface-tint:#173735;
+  --text-strong:#e5f2ef;
+  --text-body:#b8cccd;
+  --text-soft:#8ea7aa;
+  --line-soft:#223b3e;
+  --focus:#4ba99d;
+}
+
+.icon{display:block;flex:none;vertical-align:middle}
+.brand-mark{display:grid;place-items:center}
+.brand-mark .icon{stroke-width:2.1}
+.nav-symbol{display:grid;place-items:center;height:20px}
+.nav-symbol .icon{transition:transform .18s ease}
+.nav-link:hover .nav-symbol .icon,.nav-link.active .nav-symbol .icon{transform:scale(1.08)}
+.top-icon{display:grid;place-items:center}
+.top-icon .icon{stroke-width:1.9}
+.theme-toggle [data-theme-icon]{display:block}
+[data-theme="light"] [data-theme-icon="light"],[data-theme="dark"] [data-theme-icon="dark"]{display:none}
+.theme-toggle{transition:background .18s ease,color .18s ease,transform .18s ease}
+.theme-toggle:active{transform:scale(.94)}
+.login-theme-toggle{position:fixed;top:24px;right:26px;width:38px;height:38px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--text-soft);display:grid;place-items:center}
+.login-theme-toggle:hover{color:var(--teal);border-color:var(--focus)}
+
+/* Dark theme: every shared surface, control, text group and page shell follows the same tokens. */
+html[data-theme="dark"] body{background:var(--bg);color:var(--ink)}
+html[data-theme="dark"] .sidebar,html[data-theme="dark"] .topbar,html[data-theme="dark"] .card,html[data-theme="dark"] .metric,html[data-theme="dark"] .button,html[data-theme="dark"] .select,html[data-theme="dark"] .search-drawer form,html[data-theme="dark"] .search-results,html[data-theme="dark"] .login-card{background:var(--surface);border-color:var(--line)}
+html[data-theme="dark"] .sidebar{box-shadow:10px 0 30px #00000018}
+html[data-theme="dark"] .workspace,html[data-theme="dark"] .run-card,html[data-theme="dark"] .scope-card,html[data-theme="dark"] .filter-form select{background:var(--surface-raised);border-color:var(--line)}
+html[data-theme="dark"] .nav-link:hover,html[data-theme="dark"] tbody tr:hover,html[data-theme="dark"] .search-results a:hover{background:var(--surface-soft)}
+html[data-theme="dark"] .nav-link.active{background:var(--teal-light);color:var(--teal)}
+html[data-theme="dark"] .nav-link em{background:var(--surface-soft);color:var(--text-soft)}
+html[data-theme="dark"] .nav-link.active em{background:#245650;color:#79d5c4}
+html[data-theme="dark"] .brand-mark{box-shadow:0 5px 16px #00000035}
+html[data-theme="dark"] .account-avatar,html[data-theme="dark"] .top-avatar{background:#704d3d;color:#ffd8c2}
+html[data-theme="dark"] .workspace-badge{background:#1e4743;color:#7ad8c7}
+html[data-theme="dark"] .agent-icon,html[data-theme="dark"] .metric-icon.teal,html[data-theme="dark"] .queue-icon,html[data-theme="dark"] .activity-icon,html[data-theme="dark"] .db-mark,html[data-theme="dark"] .setting-icon,html[data-theme="dark"] .operation-symbol{background:#183c38;color:#72d2c0}
+html[data-theme="dark"] .metric-icon.blue,html[data-theme="dark"] .activity-icon.blue{background:#1e334b;color:#8cb8ee}
+html[data-theme="dark"] .metric-icon.amber,html[data-theme="dark"] .queue-icon.warning,html[data-theme="dark"] .activity-icon.amber,html[data-theme="dark"] .archive-symbol{background:#403321;color:#e8ad5e}
+html[data-theme="dark"] .metric-icon.purple,html[data-theme="dark"] .activity-icon.purple{background:#302942;color:#b7a1ec}
+html[data-theme="dark"] .danger-symbol,html[data-theme="dark"] .policy-icon{background:#412b2b;color:#e58d82}
+html[data-theme="dark"] .top-icon:hover,html[data-theme="dark"] .row-action:hover{background:#193b38;color:var(--teal)}
+html[data-theme="dark"] .notification i{border-color:var(--surface)}
+html[data-theme="dark"] .page-header h1,html[data-theme="dark"] .login-card h1,html[data-theme="dark"] .metric strong,html[data-theme="dark"] .card-heading h2,html[data-theme="dark"] .health-card h2,html[data-theme="dark"] .connection-card h2,html[data-theme="dark"] .plan-card h2,html[data-theme="dark"] .storage-total strong{color:var(--text-strong)}
+html[data-theme="dark"] .crumbs strong,html[data-theme="dark"] .workspace strong,html[data-theme="dark"] .agent-status strong,html[data-theme="dark"] .account strong,html[data-theme="dark"] .queue-copy strong,html[data-theme="dark"] .activity-row strong,html[data-theme="dark"] .setting-row strong,html[data-theme="dark"] .operation-option strong,html[data-theme="dark"] .scope-card strong{color:var(--text-body)}
+html[data-theme="dark"] .subtitle,html[data-theme="dark"] .card-heading p,html[data-theme="dark"] .metric small,html[data-theme="dark"] .storage-total small,html[data-theme="dark"] .queue-copy small,html[data-theme="dark"] .activity-row small,html[data-theme="dark"] .activity-row time,html[data-theme="dark"] .connection-details,html[data-theme="dark"] .engine,html[data-theme="dark"] .policy-main small,html[data-theme="dark"] .policy-rule,html[data-theme="dark"] .form-hint,html[data-theme="dark"] .operation-description,html[data-theme="dark"] .plan-card>p:not(.eyebrow),html[data-theme="dark"] .setting-row small,html[data-theme="dark"] .login-subtitle,html[data-theme="dark"] .login-footnote,html[data-theme="dark"] .login-note{color:var(--text-soft)}
+html[data-theme="dark"] th{background:var(--surface-raised);border-color:var(--line-soft);color:#829a9d}
+html[data-theme="dark"] td,html[data-theme="dark"] .queue-row,html[data-theme="dark"] .policy-row,html[data-theme="dark"] .setting-row,html[data-theme="dark"] .run-log-list{border-color:var(--line-soft);color:#a9c0c1}
+html[data-theme="dark"] .pill{background:var(--surface-raised);border-color:var(--line);color:#9db6b7}
+html[data-theme="dark"] .form-grid input,html[data-theme="dark"] .form-grid select,html[data-theme="dark"] .selected-tables input,html[data-theme="dark"] .job-side label>input,html[data-theme="dark"] .job-side label>select,html[data-theme="dark"] .manual-cron-input,html[data-theme="dark"] .login-card input{background:#0d1b1d;border-color:var(--line);color:var(--text-body)}
+html[data-theme="dark"] .form-grid label,html[data-theme="dark"] .selected-tables,html[data-theme="dark"] .schedule-card label,html[data-theme="dark"] .login-card label{color:#b9cecd}
+html[data-theme="dark"] .form-hint code,html[data-theme="dark"] .cron-box code{background:#1b403c;color:#8ed7c9}
+html[data-theme="dark"] .cron-box{background:var(--surface-raised)}
+html[data-theme="dark"] .cron-box span,html[data-theme="dark"] .input-suffix{color:var(--text-soft)}
+html[data-theme="dark"] .operation-option:has(input:checked),html[data-theme="dark"] .scope-card:has(input:checked){background:#173a36;border-color:#4d9f91;box-shadow:0 0 0 2px #2b665d}
+html[data-theme="dark"] .safety-card{background:#132d29}
+html[data-theme="dark"] .info-card{background:#30291d;border-color:#584b2e}
+html[data-theme="dark"] .info-card>span{background:#4b3c22;color:#e8b968}
+html[data-theme="dark"] .info-card strong{color:#e4c984}html[data-theme="dark"] .info-card p{color:#b5a77f}
+html[data-theme="dark"] .callout{background:#153532;border-color:#2d6058}html[data-theme="dark"] .callout-icon{background:#1d4943}html[data-theme="dark"] .callout strong{color:#9de0d2}html[data-theme="dark"] .callout small{color:#91bebb}
+html[data-theme="dark"] .health-card{background:linear-gradient(130deg,var(--surface) 64%,#163b36)}html[data-theme="dark"] .health-orbit{border-color:#397a70}html[data-theme="dark"] .health-orbit:before,html[data-theme="dark"] .health-orbit:after{border-color:#2d665f}html[data-theme="dark"] .health-orbit div{background:#1b4842;color:#9ce0d3}
+html[data-theme="dark"] .grid-lines i{border-color:#294447}html[data-theme="dark"] .progress-track{background:#294447}
+html[data-theme="dark"] .search-drawer{filter:drop-shadow(0 12px 24px #00000055)}html[data-theme="dark"] .search-drawer input{background:var(--surface);color:var(--text-body)}html[data-theme="dark"] .search-results a{border-color:var(--line-soft);color:var(--text-body)}
+html[data-theme="dark"] .login-page{background:radial-gradient(circle at 18% 15%,#173b37 0,#102326 36%,#0d1719 100%)}html[data-theme="dark"] .login-card{box-shadow:0 18px 55px #00000040}html[data-theme="dark"] .login-error{background:#422928;color:#f0a69c}
+html[data-theme="dark"] .flash{background:#194b47}html[data-theme="dark"] .flash.error{background:#643a39}
+.run-state-meta{display:flex;align-items:center;gap:9px;margin:10px 0 8px;font-size:10px}.run-freshness{font-weight:700;color:#7c969b}.run-freshness.live,.run-freshness.complete{color:#3aaf88}.run-freshness.error{color:var(--danger)}.run-auto-refresh{display:inline-flex;align-items:center;gap:5px;color:#9badaf;font-size:9px}.run-auto-refresh:before{content:'';width:6px;height:6px;border-radius:50%;background:#45b990;box-shadow:0 0 0 3px #45b99018}
+html[data-theme="dark"] .run-freshness{color:#9bb4b5}html[data-theme="dark"] .run-auto-refresh{color:#8ea7aa}

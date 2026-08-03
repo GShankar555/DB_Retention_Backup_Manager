@@ -1,4 +1,14 @@
 document.addEventListener('DOMContentLoaded', () => {
+  const theme = document.documentElement;
+  const themeButtons = document.querySelectorAll('[data-theme-toggle]');
+  const setTheme = (nextTheme) => {
+    theme.dataset.theme = nextTheme;
+    localStorage.setItem('vaultline-theme', nextTheme);
+  };
+  themeButtons.forEach((button) => button.addEventListener('click', () => {
+    setTheme(theme.dataset.theme === 'dark' ? 'light' : 'dark');
+  }));
+
   document.querySelectorAll('.local-time').forEach((node) => {
     const date = new Date(node.dataset.utc || '');
     if (!Number.isNaN(date.getTime())) {
@@ -56,6 +66,7 @@ document.addEventListener('DOMContentLoaded', () => {
     button.addEventListener('click', async () => {
       const id = button.dataset.connectionId;
       const status = document.querySelector(`#connection-status-${id}`);
+      const idleContent = button.innerHTML;
       button.disabled = true;
       button.textContent = 'Testing…';
       try {
@@ -67,19 +78,20 @@ document.addEventListener('DOMContentLoaded', () => {
         status.className = 'status review';
         status.innerHTML = '<i></i>Failed';
         toast(error.message, 'error');
-      } finally { button.disabled = false; button.textContent = 'Test connection'; }
+      } finally { button.disabled = false; button.innerHTML = idleContent; }
     });
   });
 
   document.querySelectorAll('.test-connection-form').forEach((button) => {
     button.addEventListener('click', async () => {
+      const idleContent = button.innerHTML;
       button.disabled = true;
       button.textContent = 'Testing…';
       try {
         const result = await requestJSON(`/api/connections/${button.dataset.connectionId}/test`, { method: 'POST' });
         toast(result.message);
       } catch (error) { toast(error.message, 'error'); }
-      finally { button.disabled = false; button.textContent = 'Test saved connection'; }
+      finally { button.disabled = false; button.innerHTML = idleContent; }
     });
   });
 
@@ -87,6 +99,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (newConnectionTest) {
     newConnectionTest.addEventListener('click', async () => {
       const form = document.querySelector('#connection-form');
+      const idleContent = newConnectionTest.innerHTML;
       newConnectionTest.disabled = true;
       newConnectionTest.textContent = 'Testing…';
       try {
@@ -94,20 +107,21 @@ document.addEventListener('DOMContentLoaded', () => {
         const result = await requestJSON('/api/connections/test', { method: 'POST', body: JSON.stringify(data) });
         toast(result.message);
       } catch (error) { toast(error.message, 'error'); }
-      finally { newConnectionTest.disabled = false; newConnectionTest.textContent = 'Test connection'; }
+      finally { newConnectionTest.disabled = false; newConnectionTest.innerHTML = idleContent; }
     });
   }
 
   const dryRunButton = document.querySelector('#dry-run-button');
   if (dryRunButton) {
     dryRunButton.addEventListener('click', async () => {
+      const idleContent = dryRunButton.innerHTML;
       dryRunButton.disabled = true;
       dryRunButton.textContent = 'Previewing…';
       try {
         const result = await requestJSON('/api/retention/dry-run', { method: 'POST' });
         toast(result.message);
       } catch (error) { toast(error.message, 'error'); }
-      finally { dryRunButton.disabled = false; dryRunButton.textContent = '▤  Run dry run'; }
+      finally { dryRunButton.disabled = false; dryRunButton.innerHTML = idleContent; }
     });
   }
 
@@ -129,6 +143,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const syncScheduler = document.querySelector('#sync-scheduler');
   if (syncScheduler) {
     syncScheduler.addEventListener('click', async () => {
+      const idleContent = syncScheduler.innerHTML;
       syncScheduler.disabled = true;
       syncScheduler.textContent = 'Syncing…';
       try {
@@ -136,13 +151,14 @@ document.addEventListener('DOMContentLoaded', () => {
         toast(result.message);
         window.setTimeout(() => window.location.reload(), 650);
       } catch (error) { toast(error.message, 'error'); }
-      finally { syncScheduler.disabled = false; syncScheduler.textContent = 'Sync now'; }
+      finally { syncScheduler.disabled = false; syncScheduler.innerHTML = idleContent; }
     });
   }
 
   document.querySelectorAll('.run-job').forEach((button) => {
     button.addEventListener('click', async () => {
       const jobId = button.dataset.jobId;
+      const idleContent = button.innerHTML;
       button.disabled = true;
       button.textContent = 'Starting…';
       try {
@@ -152,7 +168,7 @@ document.addEventListener('DOMContentLoaded', () => {
       } catch (error) {
         toast(error.message, 'error');
         button.disabled = false;
-        button.innerHTML = button.classList.contains('run-action') ? '<span class="run-action-icon">▶</span><span class="run-action-label">Run now</span>' : '▶';
+        button.innerHTML = idleContent;
       }
     });
   });
@@ -162,28 +178,62 @@ document.addEventListener('DOMContentLoaded', () => {
   if (refreshHistory) {
     refreshHistory.addEventListener('click', () => {
       refreshHistory.disabled = true;
-      refreshHistory.textContent = 'Refreshing…';
+      refreshHistory.innerHTML = 'Refreshing…';
       window.location.reload();
     });
   }
   if (historyJobId) {
-    window.setInterval(async () => {
+    const statusClass = (status) => status === 'success' ? 'healthy' : status === 'failed' ? 'review' : status === 'running' ? 'running' : 'neutral-status';
+    const statusLabel = (status) => status.replace('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+    const storedUtc = (value) => new Date(`${String(value || '').replace(' ', 'T').replace(/Z$/, '')}Z`);
+    const freshnessLabel = (run) => {
+      const updated = storedUtc(run.updated_at || run.started_at);
+      const ageSeconds = Math.max(0, Math.floor((Date.now() - updated.getTime()) / 1000));
+      const age = ageSeconds < 60 ? `${ageSeconds}s` : `${Math.floor(ageSeconds / 60)}m`;
+      if (run.status === 'running' && ageSeconds > 120) return `No heartbeat for ${age} · worker may be stalled`;
+      if (run.status === 'running') return `Live · updated ${age} ago`;
+      if (run.status === 'success') return `Succeeded · updated ${age} ago`;
+      if (run.status === 'failed') return `Failed · updated ${age} ago`;
+      return `Updated ${age} ago`;
+    };
+    const refreshRunCard = (card, current) => {
+      const status = card.querySelector('.status');
+      const percent = card.querySelector('.run-card-top strong');
+      const bar = card.querySelector('.progress-track span');
+      const message = card.querySelector('.run-message');
+      const freshness = card.querySelector('[data-run-freshness]');
+      const meta = card.querySelector('.run-state-meta');
+      status.className = `status ${statusClass(current.status)}`;
+      status.innerHTML = `<i></i>${statusLabel(current.status)}`;
+      percent.textContent = `${current.progress}%`;
+      bar.style.width = `${current.progress}%`;
+      message.textContent = current.message;
+      if (freshness) {
+        const updated = `${String(current.updated_at || current.started_at).replace(' ', 'T')}Z`;
+        freshness.dataset.updatedUtc = updated;
+        freshness.className = `run-freshness ${current.status === 'running' ? 'live' : current.status === 'success' ? 'complete' : current.status === 'failed' ? 'error' : ''}`;
+        freshness.textContent = freshnessLabel(current);
+      }
+      if (meta) {
+        const autoRefresh = meta.querySelector('.run-auto-refresh');
+        if (current.status === 'running' && !autoRefresh) meta.insertAdjacentHTML('beforeend', '<span class="run-auto-refresh">Auto-refreshing</span>');
+        if (current.status !== 'running' && autoRefresh) autoRefresh.remove();
+      }
+    };
+    const pollRun = async () => {
       try {
         const result = await requestJSON(`/api/jobs/${historyJobId}/runs`);
         const current = result.runs[0];
         const card = document.querySelector('.run-card');
         if (!current || !card) return;
-        const status = card.querySelector('.status');
-        const percent = card.querySelector('.run-card-top strong');
-        const bar = card.querySelector('.progress-track span');
-        const message = card.querySelector('.run-message');
-        status.className = `status ${current.status === 'success' ? 'healthy' : current.status === 'failed' ? 'review' : current.status === 'running' ? 'running' : 'neutral-status'}`;
-        status.innerHTML = `<i></i>${current.status.replace('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())}`;
-        percent.textContent = `${current.progress}%`;
-        bar.style.width = `${current.progress}%`;
-        message.textContent = current.message;
-      } catch (_error) { /* keep the already-rendered history visible */ }
-    }, 1800);
+        refreshRunCard(card, current);
+      } catch (_error) {
+        const freshness = document.querySelector('[data-run-freshness]');
+        if (freshness) freshness.textContent = 'Status check failed · retrying…';
+      }
+    };
+    pollRun();
+    window.setInterval(pollRun, 2000);
   }
 
   const form = document.querySelector('#job-form');

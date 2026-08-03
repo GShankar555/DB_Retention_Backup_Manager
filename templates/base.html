@@ -5,31 +5,33 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Vaultline · {{ active or 'Overview' }}</title>
   <meta name="description" content="Universal database backup, retention and archive manager for Linode and Cloudflare R2.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('vaultline-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
+{% from '_icons.html' import icon %}
 <body>
   <div class="shell">
     <aside class="sidebar">
-      <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark">⌁</span><span>vaultline</span></a>
+      <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark">{{ icon('logo', 18) }}</span><span>vaultline</span></a>
       <p class="nav-title">Operations</p>
       <nav>
-        {% for label, endpoint, symbol in [('Overview','dashboard','◈'),('Jobs','jobs','◌'),('Connections','connections','▦'),('Retention','retention','◇')] %}
-          <a class="nav-link {% if active == label %}active{% endif %}" href="{{ url_for(endpoint) }}"><span class="nav-symbol">{{ symbol }}</span><span>{{ label }}</span>{% if nav_counts.get(label, 0) %}<em>{{ nav_counts[label] }}</em>{% endif %}</a>
+        {% for label, endpoint, symbol in [('Overview','dashboard','dashboard'),('Jobs','jobs','jobs'),('Connections','connections','database'),('Retention','retention','shield')] %}
+          <a class="nav-link {% if active == label %}active{% endif %}" href="{{ url_for(endpoint) }}"><span class="nav-symbol">{{ icon(symbol, 16) }}</span><span>{{ label }}</span>{% if nav_counts.get(label, 0) %}<em>{{ nav_counts[label] }}</em>{% endif %}</a>
         {% endfor %}
       </nav>
       <p class="nav-title system-title">System</p>
       <nav>
-        {% for label, endpoint, symbol in [('Activity','activity','≋'),('Settings','settings','⚙')] %}
-          <a class="nav-link {% if active == label %}active{% endif %}" href="{{ url_for(endpoint) }}"><span class="nav-symbol">{{ symbol }}</span><span>{{ label }}</span></a>
+        {% for label, endpoint, symbol in [('Activity','activity','activity'),('Settings','settings','settings')] %}
+          <a class="nav-link {% if active == label %}active{% endif %}" href="{{ url_for(endpoint) }}"><span class="nav-symbol">{{ icon(symbol, 16) }}</span><span>{{ label }}</span></a>
         {% endfor %}
       </nav>
       <div class="sidebar-bottom">
-        <div class="agent-status"><span class="agent-icon">✦</span><span><strong>System scheduler</strong><small><i class="{% if scheduler_status.ready %}online-dot{% else %}offline-dot{% endif %}"></i> {{ scheduler_status.label }}</small></span><span class="more">···</span></div>
-        <div class="account"><span class="account-avatar">VA</span><span><strong>{{ logged_in_user or 'Vaultline admin' }}</strong><small>Administrator</small></span><form method="post" action="{{ url_for('logout') }}"><button class="logout-link" title="Log out">↪</button></form></div>
+        <div class="agent-status"><span class="agent-icon">{{ icon('server', 15) }}</span><span><strong>System scheduler</strong><small><i class="{% if scheduler_status.ready %}online-dot{% else %}offline-dot{% endif %}"></i> {{ scheduler_status.label }}</small></span><span class="more">···</span></div>
+        <div class="account"><span class="account-avatar">VA</span><span><strong>{{ logged_in_user or 'Vaultline admin' }}</strong><small>Administrator</small></span><form method="post" action="{{ url_for('logout') }}"><button class="logout-link" title="Log out" aria-label="Log out">{{ icon('logout', 16) }}</button></form></div>
       </div>
     </aside>
     <main class="main">
-      <header class="topbar"><div class="crumbs"><span>Vaultline</span><b>/</b><strong>{{ active or 'Overview' }}</strong></div><div class="top-actions"><button class="top-icon" id="search-button" aria-label="Search">⌕</button><a class="top-icon notification" href="{{ url_for('activity') }}" aria-label="Activity">♢</a><span class="top-avatar">VA</span></div></header>
+      <header class="topbar"><div class="crumbs"><span>Vaultline</span><b>/</b><strong>{{ active or 'Overview' }}</strong></div><div class="top-actions"><button class="top-icon" id="search-button" aria-label="Search">{{ icon('search', 17) }}</button><a class="top-icon notification" href="{{ url_for('activity') }}" aria-label="Activity">{{ icon('bell', 17) }}<i></i></a><button class="top-icon theme-toggle" type="button" data-theme-toggle aria-label="Switch theme"><span data-theme-icon="light">{{ icon('sun', 17) }}</span><span data-theme-icon="dark">{{ icon('moon', 17) }}</span></button><span class="top-avatar">VA</span></div></header>
       <div class="page">
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}<div class="flash-stack">{% for category, message in messages %}<div class="flash {{ category }}"><span>{% if category == 'success' %}✓{% else %}!{% endif %}</span>{{ message }}</div>{% endfor %}</div>{% endif %}
@@ -38,7 +40,7 @@
       </div>
     </main>
   </div>
-  <div class="search-drawer" id="search-drawer" hidden><form id="search-form"><input autofocus placeholder="Search jobs, connections..." id="global-search"><button type="button" id="close-search">×</button></form><div id="search-results" class="search-results"></div></div>
+  <div class="search-drawer" id="search-drawer" hidden><form id="search-form"><input autofocus placeholder="Search jobs, connections..." id="global-search"><button type="button" id="close-search" aria-label="Close search">×</button></form><div id="search-results" class="search-results"></div></div>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

@@ -1,14 +1,16 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Vaultline · Sign in</title><link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Vaultline · Sign in</title><script>document.documentElement.dataset.theme = localStorage.getItem('vaultline-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script><link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}"></head>
+{% from '_icons.html' import icon %}
 <body class="login-page">
+  <button class="login-theme-toggle theme-toggle" type="button" data-theme-toggle aria-label="Switch theme"><span data-theme-icon="light">{{ icon('sun', 17) }}</span><span data-theme-icon="dark">{{ icon('moon', 17) }}</span></button>
   <main class="login-shell">
-    <div class="login-brand"><span class="brand-mark">⌁</span><span>vaultline</span></div>
+    <div class="login-brand"><span class="brand-mark">{{ icon('logo', 18) }}</span><span>vaultline</span></div>
     <section class="login-card">
       <p class="eyebrow"><i></i> LINODE DATA CONTROL PLANE</p>
       <h1>Welcome back</h1><p class="login-subtitle">Sign in to manage backups, retention policies and R2 archives.</p>
       {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="login-error">{% for category, message in messages %}{{ message }}{% endfor %}</div>{% endif %}{% endwith %}
-      <form method="post"><label>Username<input name="username" type="email" autocomplete="username" placeholder="vaultline@admin" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required></label><button class="button primary login-button" type="submit">Sign in &nbsp;→</button></form>
+      <form method="post"><label>Username<input name="username" type="email" autocomplete="username" placeholder="vaultline@admin" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required></label><button class="button primary login-button" type="submit">Sign in {{ icon('arrow-up-right', 15) }}</button></form>
       <p class="login-footnote">Local administrator access · session protected</p>
     </section>
     <p class="login-note">Runs on your Linode VM · SQLite metadata · Cloudflare R2 ready</p>

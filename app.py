@@ -109,6 +109,7 @@ def init_db() -> None:
             rows_processed INTEGER NOT NULL DEFAULT 0,
             rows_deleted INTEGER NOT NULL DEFAULT 0,
             started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             finished_at TEXT,
             FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
         );
@@ -145,6 +146,9 @@ def init_db() -> None:
         db.execute("ALTER TABLE job_runs ADD COLUMN rows_processed INTEGER NOT NULL DEFAULT 0")
     if "rows_deleted" not in run_columns:
         db.execute("ALTER TABLE job_runs ADD COLUMN rows_deleted INTEGER NOT NULL DEFAULT 0")
+    if "updated_at" not in run_columns:
+        db.execute("ALTER TABLE job_runs ADD COLUMN updated_at TEXT")
+        db.execute("UPDATE job_runs SET updated_at = COALESCE(finished_at, started_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL")
     # Seed the reusable default target from an existing configured job once.
     existing_default = db.execute("SELECT 1 FROM settings WHERE key = 'r2_account_id'").fetchone()
     if not existing_default:
