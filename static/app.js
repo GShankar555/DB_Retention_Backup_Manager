@@ -1,4 +1,12 @@
 document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.local-time').forEach((node) => {
+    const date = new Date(node.dataset.utc || '');
+    if (!Number.isNaN(date.getTime())) {
+      node.textContent = date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
+      node.title = `Stored as ${node.dataset.utc} (UTC)`;
+    }
+  });
+
   const toast = (message, tone = 'success') => {
     const current = document.querySelector('.client-toast');
     if (current) current.remove();

@@ -8,7 +8,7 @@ Flask-first control plane for universal database backups, retention and archive 
 - SQLite metadata storage for database connections, jobs and activity logs.
 - Connection options for PostgreSQL, MySQL, MariaDB, SQL Server and MongoDB.
 - Three job modes: backup to Cloudflare R2, data retention, and archive old rows to Parquet in R2 before deleting them.
-- Daily, weekly, biweekly and monthly schedules, with date/time/timezone fields and generated cron expressions.
+- Daily, weekly, biweekly and monthly schedules, with date/time/timezone fields and generated cron expressions. Each generated entry includes `CRON_TZ`, so a 23:00 Asia/Kolkata job stays at 23:00 IST even when the VM uses UTC.
 - Direct cron override for advanced operators.
 - CRUD flows for jobs and connections, with destructive action confirmation.
 - Dry-run protection and an activity/audit view.
@@ -21,7 +21,7 @@ Flask-first control plane for universal database backups, retention and archive 
 
 1. **Connect:** validate source credentials with the selected database adapter and keep secrets encrypted on the Linode VM.
 2. **Preview:** query row counts, table scope and estimated bytes. Require approval for destructive jobs unless dry-run is selected.
-3. **Schedule:** job create/update/delete rewrites `/etc/cron.d/vaultline` with the saved cron expression and worker command. Set `VAULTLINE_CRON_FILE`, `VAULTLINE_CRON_USER`, and `VAULTLINE_WORKER` when the deployment uses different paths or users.
+3. **Schedule:** job create/update/delete rewrites `/etc/cron.d/vaultline` with the saved cron expression, `CRON_TZ` and worker command. Click **Settings → Sync now** after deploying scheduler changes. Set `VAULTLINE_CRON_FILE`, `VAULTLINE_CRON_USER`, and `VAULTLINE_WORKER` when the deployment uses different paths or users.
 4. **Execute:** stream native backups or table batches to R2 using its S3-compatible API. Archive jobs should write Parquet parts with a stable schema and metadata manifest.
 5. **Verify:** check object existence, size and checksum before deleting source rows. The worker run ledger now stores useful milestone status/progress events; write each stage to it and mark the job result.
 

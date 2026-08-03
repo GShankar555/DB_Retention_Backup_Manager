@@ -11,6 +11,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, Response, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
 
@@ -138,6 +139,21 @@ def build_cron(cadence: str, run_date: str, run_time: str) -> str:
     return f"{minute} {hour} {date.day} * *"
 
 
+def valid_timezone(value: str | None) -> str:
+    """Return a cron-compatible IANA timezone, or the application default."""
+    candidate = (value or "Asia/Kolkata").strip()
+    try:
+        ZoneInfo(candidate)
+    except (ZoneInfoNotFoundError, ValueError):
+        return "Asia/Kolkata"
+    return candidate
+
+
+def server_timezone() -> str:
+    current = datetime.now().astimezone()
+    return getattr(current.tzinfo, "key", None) or current.tzname() or "local"
+
+
 def log_activity(title: str, detail: str, tone: str = "teal") -> None:
     db = get_db()
     db.execute("INSERT INTO activity (title, detail, tone) VALUES (?, ?, ?)", (title, detail, tone))
@@ -239,6 +255,7 @@ def scheduler_info() -> dict:
         "label": "Ready" if ready else ("Cron installed; worker missing" if installed else "Not installed"),
         "path": str(CRON_FILE),
         "worker_path": str(WORKER_SCRIPT),
+        "server_timezone": server_timezone(),
     }
 
 
@@ -259,7 +276,7 @@ def fetch_jobs(order: str = "DESC") -> list[sqlite3.Row]:
 def sync_cron_file() -> tuple[bool, str]:
     """Rewrite the managed /etc/cron.d file from enabled SQLite jobs."""
     db = get_db()
-    jobs = db.execute("SELECT id, name, cron_expression FROM jobs WHERE enabled = 1 ORDER BY id").fetchall()
+    jobs = db.execute("SELECT id, name, cron_expression, timezone FROM jobs WHERE enabled = 1 ORDER BY id").fetchall()
     try:
         if not jobs:
             if CRON_FILE.exists():
@@ -280,6 +297,7 @@ def sync_cron_file() -> tuple[bool, str]:
             log_path = shlex.quote(str(LOG_DIR / f"job-{job['id']}.log"))
             command = f"{job['cron_expression']} {CRON_USER} cd {workdir} && {python_bin} {worker} --job-id {job['id']} >> {log_path} 2>&1"
             lines.append(f"# {job['name']} (job {job['id']})")
+            lines.append(f"CRON_TZ={valid_timezone(job['timezone'])}")
             lines.append(command)
         lines.append("")
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=CRON_FILE.parent, delete=False) as temporary:
@@ -312,7 +330,7 @@ def form_payload() -> dict:
         "cadence": cadence,
         "run_date": run_date,
         "run_time": run_time,
-        "timezone": request.form.get("timezone", "Asia/Kolkata"),
+        "timezone": valid_timezone(request.form.get("timezone", "Asia/Kolkata")),
         "cron_expression": request.form.get("cron_expression", "").strip() or build_cron(cadence, run_date, run_time),
         "retention_days": request.form.get("retention_days", type=int),
         "tables_scope": request.form.get("tables_scope", "all"),
