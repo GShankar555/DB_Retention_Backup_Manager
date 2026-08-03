@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from app import app, get_db, init_db
-from worker_adapters import AdapterError, backup_database, preview_row_job, process_row_job
+from worker_adapters import AdapterError, create_backup_artifact, preview_row_job, process_row_job, upload_backup_artifact
 
 
 def event(run_id: int, status: str, progress: int, message: str, finish: bool = False) -> None:
@@ -73,8 +73,10 @@ def run_job(job_id: int) -> int:
             with tempfile.TemporaryDirectory(prefix=f"vaultline-run-{run_id}-") as temporary:
                 temp_dir = Path(temporary)
                 if job["job_type"] == "backup":
-                    event(run_id, "running", 60, "Created native database backup; uploading to R2")
-                    uploaded = backup_database(job, run_id, temp_dir)
+                    event(run_id, "running", 60, "Creating native database backup")
+                    artifact, content_type = create_backup_artifact(job, temp_dir)
+                    event(run_id, "running", 75, f"Native backup created ({artifact.stat().st_size} bytes); uploading to R2")
+                    uploaded = upload_backup_artifact(job, run_id, artifact, content_type)
                     db.execute(
                         "INSERT INTO r2_objects (run_id, job_id, bucket, object_key, format, size_bytes, etag) VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (run_id, job["id"], uploaded["bucket"], uploaded["key"], uploaded["format"], uploaded["size_bytes"], uploaded.get("etag")),

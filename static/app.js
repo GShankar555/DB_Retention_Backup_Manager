@@ -158,6 +158,14 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   const historyJobId = document.body.dataset.runHistoryJob;
+  const refreshHistory = document.querySelector('#refresh-history');
+  if (refreshHistory) {
+    refreshHistory.addEventListener('click', () => {
+      refreshHistory.disabled = true;
+      refreshHistory.textContent = 'Refreshing…';
+      window.location.reload();
+    });
+  }
   if (historyJobId) {
     window.setInterval(async () => {
       try {

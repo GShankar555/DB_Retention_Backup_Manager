@@ -77,9 +77,8 @@ def locate_tool(name: str, environment_key: str | None = None) -> str | None:
 
 def object_key(job: Any, run_id: int, filename: str) -> str:
     source = slug(str(field(job, "connection_name", "database")))
-    name = slug(str(field(job, "name", "job")))
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y/%m/%d/%H%M%S")
-    return f"vaultline/{source}/{name}/run-{run_id}/{stamp}-{filename}"
+    date = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    return f"vaultline/{source}/{date}/run-{run_id}-{filename}"
 
 
 def r2_client(job: Any):
@@ -94,12 +93,18 @@ def r2_client(job: Any):
     except ImportError as error:
         raise AdapterError("R2 adapter is unavailable: install boto3 from requirements.txt.") from error
     endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
+    try:
+        from botocore.config import Config
+        config = Config(connect_timeout=15, read_timeout=120, retries={"max_attempts": 3, "mode": "standard"})
+    except ImportError:
+        config = None
     client = boto3.client(
         "s3",
         endpoint_url=endpoint,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name="auto",
+        **({"config": config} if config else {}),
     )
     return client, bucket
 
@@ -152,6 +157,7 @@ def create_native_backup(job: Any, destination: Path) -> tuple[str, str]:
             raise AdapterError("PostgreSQL backup requires pg_dump; set VAULTLINE_PG_DUMP to its absolute path if cron cannot find it.")
         env["PGPASSWORD"] = str(values["password"])
         env["PGSSLMODE"] = str(values["ssl_mode"])
+        env["PGCONNECT_TIMEOUT"] = "15"
         command = [
             utility, "--host", str(values["host"]), "--port", str(values["port"]),
             "--username", str(values["username"]), "--dbname", str(values["database"]),
@@ -216,15 +222,25 @@ def create_sqlserver_logical_backup(job: Any, destination: Path) -> None:
         connection.close()
 
 
-def backup_database(job: Any, run_id: int, temp_dir: Path) -> dict[str, Any]:
+def create_backup_artifact(job: Any, temp_dir: Path) -> tuple[Path, str]:
     extension = {"postgresql": ".dump", "mysql": ".sql", "mariadb": ".sql", "mongodb": ".archive.gz", "sqlserver": ".tar.gz", "mssql": ".tar.gz"}.get(engine_name(job), ".backup")
     filename = f"{slug(str(field(job, 'database_name', 'database')))}{extension}"
     destination = temp_dir / filename
     generated, content_type = create_native_backup(job, destination)
+    return destination, content_type
+
+
+def upload_backup_artifact(job: Any, run_id: int, path: Path, content_type: str) -> dict[str, Any]:
+    generated = path.name
     key = object_key(job, run_id, generated)
-    result = upload_to_r2(job, destination, key, content_type)
+    result = upload_to_r2(job, path, key, content_type)
     result["format"] = generated.rsplit(".", 1)[-1]
     return result
+
+
+def backup_database(job: Any, run_id: int, temp_dir: Path) -> dict[str, Any]:
+    destination, content_type = create_backup_artifact(job, temp_dir)
+    return upload_backup_artifact(job, run_id, destination, content_type)
 
 
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
