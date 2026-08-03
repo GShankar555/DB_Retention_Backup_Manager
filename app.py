@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 import csv
 import io
+import shlex
 import sqlite3
 import secrets
+import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +18,9 @@ BASE_DIR = Path(__file__).resolve().parent
 INSTANCE_DIR = BASE_DIR / "instance"
 DATABASE = Path(os.getenv("VAULTLINE_DB", INSTANCE_DIR / "vaultline.db"))
 CRON_FILE = Path(os.getenv("VAULTLINE_CRON_FILE", "/etc/cron.d/vaultline"))
+CRON_USER = os.getenv("VAULTLINE_CRON_USER", "root")
+WORKER_SCRIPT = Path(os.getenv("VAULTLINE_WORKER", BASE_DIR / "worker.py"))
+LOG_DIR = Path(os.getenv("VAULTLINE_LOG_DIR", "/var/log/vaultline"))
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("VAULTLINE_SECRET", "change-this-in-production")
@@ -203,11 +209,57 @@ def setting_value(key: str, default: str = "") -> str:
 
 def scheduler_info() -> dict:
     installed = CRON_FILE.exists()
+    worker_exists = WORKER_SCRIPT.exists()
+    ready = installed and worker_exists
     return {
         "installed": installed,
-        "label": "Installed" if installed else "Not installed",
+        "worker_exists": worker_exists,
+        "ready": ready,
+        "label": "Ready" if ready else ("Cron installed; worker missing" if installed else "Not installed"),
         "path": str(CRON_FILE),
+        "worker_path": str(WORKER_SCRIPT),
     }
+
+
+def sync_cron_file() -> tuple[bool, str]:
+    """Rewrite the managed /etc/cron.d file from enabled SQLite jobs."""
+    db = get_db()
+    jobs = db.execute("SELECT id, name, cron_expression FROM jobs WHERE enabled = 1 ORDER BY id").fetchall()
+    try:
+        if not jobs:
+            if CRON_FILE.exists():
+                CRON_FILE.unlink()
+            return True, "No enabled jobs; managed cron file removed."
+        CRON_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        python_bin = shlex.quote(sys.executable)
+        worker = shlex.quote(str(WORKER_SCRIPT))
+        workdir = shlex.quote(str(BASE_DIR))
+        lines = [
+            "# Managed by Vaultline. Manual edits will be overwritten.",
+            "SHELL=/bin/sh",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "",
+        ]
+        for job in jobs:
+            log_path = shlex.quote(str(LOG_DIR / f"job-{job['id']}.log"))
+            command = f"{job['cron_expression']} {CRON_USER} cd {workdir} && {python_bin} {worker} --job-id {job['id']} >> {log_path} 2>&1"
+            lines.append(f"# {job['name']} (job {job['id']})")
+            lines.append(command)
+        lines.append("")
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=CRON_FILE.parent, delete=False) as temporary:
+            temporary.write("\n".join(lines))
+            temporary_path = Path(temporary.name)
+        os.chmod(temporary_path, 0o644)
+        os.replace(temporary_path, CRON_FILE)
+        return True, f"{len(jobs)} cron job(s) installed in {CRON_FILE}."
+    except OSError as error:
+        try:
+            if "temporary_path" in locals() and temporary_path.exists():
+                temporary_path.unlink()
+        except OSError:
+            pass
+        return False, f"Could not update {CRON_FILE}: {error}"
 
 
 def form_payload() -> dict:
@@ -334,8 +386,9 @@ def new_job():
             placeholders = ", ".join("?" for _ in payload)
             db.execute(f"INSERT INTO jobs ({columns}) VALUES ({placeholders})", tuple(payload.values()))
             db.commit()
-            log_activity("New job created", f"{payload['name']} · system cron installed", "teal")
-            flash("Job created. The system-level cron entry is ready to install.", "success")
+            cron_ok, cron_message = sync_cron_file()
+            log_activity("New job created", f"{payload['name']} · {cron_message}", "teal" if cron_ok else "amber")
+            flash("Job created and system cron updated." if cron_ok else f"Job saved, but cron update failed: {cron_message}", "success" if cron_ok else "error")
             return redirect(url_for("jobs"))
     return render_template("job_form.html", active="Jobs", connections=connections, job=None, form=request.form)
 
@@ -352,8 +405,9 @@ def edit_job(job_id: int):
         assignments = ", ".join(f"{key} = ?" for key in payload)
         db.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", (*payload.values(), job_id))
         db.commit()
-        log_activity("Job updated", f"{payload['name']} · configuration saved", "blue")
-        flash("Job updated successfully.", "success")
+        cron_ok, cron_message = sync_cron_file()
+        log_activity("Job updated", f"{payload['name']} · {cron_message}", "blue" if cron_ok else "amber")
+        flash("Job updated and system cron refreshed." if cron_ok else f"Job saved, but cron update failed: {cron_message}", "success" if cron_ok else "error")
         return redirect(url_for("jobs"))
     return render_template("job_form.html", active="Jobs", connections=connections, job=job, form=dict(job))
 
@@ -365,8 +419,9 @@ def delete_job(job_id: int):
     if job:
         db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         db.commit()
-        log_activity("Job deleted", f"{job['name']} · cron entry removed", "amber")
-        flash("Job deleted and its cron entry removed.", "success")
+        cron_ok, cron_message = sync_cron_file()
+        log_activity("Job deleted", f"{job['name']} · {cron_message}", "amber")
+        flash("Job deleted and system cron refreshed." if cron_ok else f"Job deleted, but cron update failed: {cron_message}", "success" if cron_ok else "error")
     return redirect(request.referrer or url_for("jobs"))
 
 
@@ -400,8 +455,9 @@ def delete_connection(connection_id: int):
     if connection:
         db.execute("DELETE FROM connections WHERE id = ?", (connection_id,))
         db.commit()
-        log_activity("Connection removed", connection["name"], "amber")
-        flash("Connection removed. Related jobs were removed too.", "success")
+        cron_ok, cron_message = sync_cron_file()
+        log_activity("Connection removed", f"{connection['name']} · {cron_message}", "amber")
+        flash("Connection removed and system cron refreshed." if cron_ok else f"Connection removed, but cron update failed: {cron_message}", "success" if cron_ok else "error")
     return redirect(url_for("connections"))
 
 
@@ -538,6 +594,12 @@ def api_metrics():
 @app.get("/api/system/scheduler")
 def api_scheduler_status():
     return jsonify(scheduler_info())
+
+
+@app.post("/api/system/scheduler/sync")
+def api_scheduler_sync():
+    ok, message = sync_cron_file()
+    return jsonify({"ok": ok, "message": message, **scheduler_info()}), (200 if ok else 500)
 
 
 @app.get("/api/export/report")

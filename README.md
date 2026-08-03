@@ -15,12 +15,13 @@ Flask-first control plane for universal database backups, retention and archive 
 - Simple session authentication with the provided administrator credentials.
 - Authenticated JSON endpoints: `/api/health`, `/api/jobs`, and `/api/connections`.
 - Working control APIs for connection testing, search, CSV export, retention dry runs, SQLite backup, R2 settings and metrics.
+- Job create/update/delete automatically rewrites a managed system cron file, defaulting to `/etc/cron.d/vaultline`.
 
 ## Build plan for the production worker
 
 1. **Connect:** validate source credentials with the selected database adapter and keep secrets encrypted on the Linode VM.
 2. **Preview:** query row counts, table scope and estimated bytes. Require approval for destructive jobs unless dry-run is selected.
-3. **Schedule:** render the saved cron expression into `/etc/cron.d/vaultline` with a dedicated service user. Keep cron outside Flask so jobs survive application restarts.
+3. **Schedule:** job create/update/delete rewrites `/etc/cron.d/vaultline` with the saved cron expression and worker command. Set `VAULTLINE_CRON_FILE`, `VAULTLINE_CRON_USER`, and `VAULTLINE_WORKER` when the deployment uses different paths or users.
 4. **Execute:** stream native backups or table batches to R2 using its S3-compatible API. Archive jobs should write Parquet parts with a stable schema and metadata manifest.
 5. **Verify:** check object existence, size and checksum before deleting source rows. Write each stage to the activity log and mark the job result.
 
@@ -36,11 +37,6 @@ python app.py
 The connection tester uses `psycopg` for PostgreSQL, `PyMySQL` for MySQL/MariaDB, and `pymongo` for MongoDB. SQL Server testing requires `pyodbc` plus Microsoft ODBC Driver 18 to be installed on the Linode VM.
 
 Open `http://localhost:5000`. The SQLite database is created at `instance/vaultline.db` unless `VAULTLINE_DB` is set.
-
-Default administrator login:
-
-- Username: `vaultline@admin`
-- Password: `VaultLine@Admin12345`
 
 For deployment, override them with `VAULTLINE_ADMIN_USERNAME`, `VAULTLINE_ADMIN_PASSWORD`, and set a strong `VAULTLINE_SECRET`.
 

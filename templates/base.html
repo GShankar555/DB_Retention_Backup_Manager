@@ -24,7 +24,7 @@
         {% endfor %}
       </nav>
       <div class="sidebar-bottom">
-        <div class="agent-status"><span class="agent-icon">✦</span><span><strong>System scheduler</strong><small><i class="{% if scheduler_status.installed %}online-dot{% else %}offline-dot{% endif %}"></i> {{ scheduler_status.label }}</small></span><span class="more">···</span></div>
+        <div class="agent-status"><span class="agent-icon">✦</span><span><strong>System scheduler</strong><small><i class="{% if scheduler_status.ready %}online-dot{% else %}offline-dot{% endif %}"></i> {{ scheduler_status.label }}</small></span><span class="more">···</span></div>
         <div class="account"><span class="account-avatar">VA</span><span><strong>{{ logged_in_user or 'Vaultline admin' }}</strong><small>Administrator</small></span><form method="post" action="{{ url_for('logout') }}"><button class="logout-link" title="Log out">↪</button></form></div>
       </div>
     </aside>

@@ -118,6 +118,20 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  const syncScheduler = document.querySelector('#sync-scheduler');
+  if (syncScheduler) {
+    syncScheduler.addEventListener('click', async () => {
+      syncScheduler.disabled = true;
+      syncScheduler.textContent = 'Syncing…';
+      try {
+        const result = await requestJSON('/api/system/scheduler/sync', { method: 'POST' });
+        toast(result.message);
+        window.setTimeout(() => window.location.reload(), 650);
+      } catch (error) { toast(error.message, 'error'); }
+      finally { syncScheduler.disabled = false; syncScheduler.textContent = 'Sync now'; }
+    });
+  }
+
   const form = document.querySelector('#job-form');
   if (!form) return;
   const cadence = document.querySelector('#cadence');
