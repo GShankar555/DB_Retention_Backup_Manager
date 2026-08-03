@@ -132,6 +132,44 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  document.querySelectorAll('.run-job').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const jobId = button.dataset.jobId;
+      button.disabled = true;
+      button.textContent = 'Starting…';
+      try {
+        const result = await requestJSON(`/api/jobs/${jobId}/run`, { method: 'POST' });
+        toast(result.message);
+        window.setTimeout(() => { window.location.href = `/jobs/${jobId}/runs`; }, 450);
+      } catch (error) {
+        toast(error.message, 'error');
+        button.disabled = false;
+        button.innerHTML = '▶';
+      }
+    });
+  });
+
+  const historyJobId = document.body.dataset.runHistoryJob;
+  if (historyJobId) {
+    window.setInterval(async () => {
+      try {
+        const result = await requestJSON(`/api/jobs/${historyJobId}/runs`);
+        const current = result.runs[0];
+        const card = document.querySelector('.run-card');
+        if (!current || !card) return;
+        const status = card.querySelector('.status');
+        const percent = card.querySelector('.run-card-top strong');
+        const bar = card.querySelector('.progress-track span');
+        const message = card.querySelector('.run-message');
+        status.className = `status ${current.status === 'success' ? 'healthy' : current.status === 'failed' ? 'review' : current.status === 'running' ? 'running' : 'neutral-status'}`;
+        status.innerHTML = `<i></i>${current.status.replace('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())}`;
+        percent.textContent = `${current.progress}%`;
+        bar.style.width = `${current.progress}%`;
+        message.textContent = current.message;
+      } catch (_error) { /* keep the already-rendered history visible */ }
+    }, 1800);
+  }
+
   const form = document.querySelector('#job-form');
   if (!form) return;
   const cadence = document.querySelector('#cadence');

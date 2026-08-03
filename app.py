@@ -6,6 +6,7 @@ import io
 import shlex
 import sqlite3
 import secrets
+import subprocess
 import sys
 import tempfile
 from datetime import datetime
@@ -95,6 +96,26 @@ def init_db() -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS job_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            progress INTEGER NOT NULL DEFAULT 0,
+            message TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT,
+            FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS job_run_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            level TEXT NOT NULL DEFAULT 'info',
+            status TEXT NOT NULL,
+            progress INTEGER NOT NULL DEFAULT 0,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (run_id) REFERENCES job_runs(id) ON DELETE CASCADE
         );
         """
     )
@@ -221,6 +242,20 @@ def scheduler_info() -> dict:
     }
 
 
+JOB_SELECT = """SELECT jobs.*, connections.name AS connection_name, connections.engine,
+                       connections.database_name, latest_run.status AS latest_status,
+                       latest_run.progress AS latest_progress, latest_run.message AS latest_message,
+                       latest_run.started_at AS latest_started_at, latest_run.finished_at AS latest_finished_at
+                FROM jobs JOIN connections ON connections.id = jobs.connection_id
+                LEFT JOIN job_runs latest_run ON latest_run.id = (
+                    SELECT MAX(id) FROM job_runs WHERE job_runs.job_id = jobs.id
+                )"""
+
+
+def fetch_jobs(order: str = "DESC") -> list[sqlite3.Row]:
+    return get_db().execute(f"{JOB_SELECT} ORDER BY jobs.id {order}").fetchall()
+
+
 def sync_cron_file() -> tuple[bool, str]:
     """Rewrite the managed /etc/cron.d file from enabled SQLite jobs."""
     db = get_db()
@@ -341,9 +376,7 @@ def logout():
 @app.route("/")
 def dashboard():
     db = get_db()
-    jobs = db.execute("""SELECT jobs.*, connections.name AS connection_name, connections.engine, connections.database_name
-                        FROM jobs JOIN connections ON connections.id = jobs.connection_id
-                        ORDER BY jobs.id DESC""").fetchall()
+    jobs = fetch_jobs()
     connections = db.execute("SELECT * FROM connections ORDER BY id").fetchall()
     activities = db.execute("SELECT * FROM activity ORDER BY id DESC LIMIT 5").fetchall()
     next_job = jobs[0] if jobs else None
@@ -362,8 +395,7 @@ def dashboard():
 def jobs():
     db = get_db()
     filter_type = request.args.get("filter", "all")
-    query = """SELECT jobs.*, connections.name AS connection_name, connections.engine, connections.database_name
-                FROM jobs JOIN connections ON connections.id = jobs.connection_id"""
+    query = JOB_SELECT
     params = []
     if filter_type in {"backup", "archive", "retention"}:
         query += " WHERE jobs.job_type = ?"
@@ -526,12 +558,19 @@ def api_health():
 
 @app.get("/api/jobs")
 def api_jobs():
-    rows = get_db().execute("""SELECT jobs.id, jobs.name, jobs.job_type, jobs.cadence,
+    rows = get_db().execute(f"""SELECT jobs.id, jobs.name, jobs.job_type, jobs.cadence,
                               jobs.run_date, jobs.run_time, jobs.cron_expression,
                               jobs.enabled, connections.name AS connection_name,
-                              connections.engine, connections.database_name
+                              connections.engine, connections.database_name,
+                              latest_run.status AS latest_status,
+                              latest_run.progress AS latest_progress,
+                              latest_run.message AS latest_message,
+                              latest_run.started_at AS latest_started_at,
+                              latest_run.finished_at AS latest_finished_at
                               FROM jobs JOIN connections ON connections.id = jobs.connection_id
-                              ORDER BY jobs.id DESC""").fetchall()
+                              LEFT JOIN job_runs latest_run ON latest_run.id = (
+                                SELECT MAX(id) FROM job_runs WHERE job_runs.job_id = jobs.id
+                              ) ORDER BY jobs.id DESC""").fetchall()
     return jsonify([dict(row) for row in rows])
 
 
@@ -541,6 +580,54 @@ def api_connections():
                               username, ssl_mode, created_at
                               FROM connections ORDER BY id DESC""").fetchall()
     return jsonify([dict(row) for row in rows])
+
+
+@app.route("/jobs/<int:job_id>/runs")
+def job_runs(job_id: int):
+    db = get_db()
+    job = db.execute(f"{JOB_SELECT} WHERE jobs.id = ?", (job_id,)).fetchone()
+    if job is None:
+        return redirect(url_for("jobs"))
+    runs = db.execute("SELECT * FROM job_runs WHERE job_id = ? ORDER BY id DESC LIMIT 20", (job_id,)).fetchall()
+    logs = {}
+    for run in runs:
+        logs[run["id"]] = db.execute("SELECT * FROM job_run_logs WHERE run_id = ? ORDER BY id", (run["id"],)).fetchall()
+    return render_template("job_runs.html", active="Jobs", job=job, runs=runs, logs=logs)
+
+
+@app.post("/api/jobs/<int:job_id>/run")
+def api_run_job(job_id: int):
+    db = get_db()
+    job = db.execute("SELECT id, name, enabled FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if job is None:
+        return jsonify({"ok": False, "message": "Job not found."}), 404
+    if not job["enabled"]:
+        return jsonify({"ok": False, "message": "Job is disabled."}), 409
+    if not WORKER_SCRIPT.exists():
+        return jsonify({"ok": False, "message": f"Worker is missing: {WORKER_SCRIPT}"}), 503
+    running = db.execute("SELECT id FROM job_runs WHERE job_id = ? AND status = 'running'", (job_id,)).fetchone()
+    if running:
+        return jsonify({"ok": False, "message": "This job is already running.", "run_id": running["id"]}), 409
+    process = subprocess.Popen(
+        [sys.executable, str(WORKER_SCRIPT), "--job-id", str(job_id)],
+        cwd=str(BASE_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return jsonify({"ok": True, "message": f"{job['name']} queued.", "process_id": process.pid}), 202
+
+
+@app.get("/api/jobs/<int:job_id>/runs")
+def api_job_runs(job_id: int):
+    db = get_db()
+    if db.execute("SELECT id FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
+        return jsonify({"ok": False, "message": "Job not found."}), 404
+    runs = db.execute("SELECT * FROM job_runs WHERE job_id = ? ORDER BY id DESC LIMIT 20", (job_id,)).fetchall()
+    payload = []
+    for run in runs:
+        item = dict(run)
+        item["logs"] = [dict(log) for log in db.execute("SELECT * FROM job_run_logs WHERE run_id = ? ORDER BY id", (run["id"],)).fetchall()]
+        payload.append(item)
+    return jsonify({"ok": True, "runs": payload})
 
 
 @app.post("/api/connections/test")
