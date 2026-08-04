@@ -19,6 +19,9 @@ import tempfile
 import tarfile
 from pathlib import Path
 from typing import Any
+from itertools import islice
+
+from archive_contract import build_manifest, data_key, manifest_key
 
 
 class AdapterError(RuntimeError):
@@ -126,6 +129,16 @@ def upload_to_r2(job: Any, path: Path, key: str, content_type: str) -> dict[str,
     if actual != expected:
         raise AdapterError(f"R2 verification failed: local size {expected} bytes, remote size {actual} bytes.")
     return {"bucket": bucket, "key": key, "size_bytes": actual, "etag": str(head.get("ETag", "")).strip('"')}
+
+
+def upload_manifest(job: Any, manifest: dict[str, Any], temp_dir: Path) -> dict[str, Any]:
+    """Upload a self-describing archive manifest after data-object verification."""
+    key = str(manifest["manifest_key"])
+    path = temp_dir / f"manifest-{slug(str(manifest['archive_id']))}.json"
+    path.write_text(json.dumps(manifest, default=str, indent=2, sort_keys=True), encoding="utf-8")
+    result = upload_to_r2(job, path, key, "application/json")
+    result.update({"format": "manifest", "kind": "manifest", "archive_id": manifest["archive_id"], "manifest": manifest})
+    return result
 
 
 def run_command(command: list[str], destination: Path, env: dict[str, str]) -> None:
@@ -394,6 +407,63 @@ def table_columns(connection, job: Any, schema: str | None, table: str) -> set[s
     return {str(row["column_name"] if "column_name" in row else row["COLUMN_NAME"]) for row in cursor_rows(cursor)}
 
 
+def table_primary_keys(connection, job: Any, schema: str | None, table: str) -> list[str]:
+    engine = engine_name(job)
+    cursor = connection.cursor()
+    if engine == "postgresql":
+        cursor.execute(
+            """SELECT kcu.column_name
+               FROM information_schema.table_constraints tc
+               JOIN information_schema.key_column_usage kcu
+                 ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
+                AND tc.table_name = kcu.table_name
+              WHERE tc.constraint_type = 'PRIMARY KEY'
+                AND tc.table_schema = %s AND tc.table_name = %s
+              ORDER BY kcu.ordinal_position""",
+            (schema or "public", table),
+        )
+        rows = cursor_rows(cursor)
+        return [str(row.get("column_name")) for row in rows if row.get("column_name")]
+    if engine in {"mysql", "mariadb"}:
+        cursor.execute(
+            """SELECT COLUMN_NAME AS column_name
+               FROM information_schema.key_column_usage
+              WHERE constraint_name = 'PRIMARY'
+                AND table_schema = %s AND table_name = %s
+              ORDER BY ORDINAL_POSITION""",
+            (field(job, "database_name"), table),
+        )
+        rows = cursor_rows(cursor)
+        return [str(row.get("column_name")) for row in rows if row.get("column_name")]
+    if engine in {"sqlserver", "mssql"}:
+        cursor.execute(
+            """SELECT ku.COLUMN_NAME AS column_name
+                 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku
+                   ON tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+                WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                  AND tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ?
+                ORDER BY ku.ORDINAL_POSITION""",
+            (schema or "dbo", table),
+        )
+        rows = cursor_rows(cursor)
+        return [str(row.get("column_name")) for row in rows if row.get("column_name")]
+    return []
+
+
+def archive_bounds(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any) -> tuple[Any, Any]:
+    engine = engine_name(job)
+    reference = table_reference(engine, schema, table)
+    cursor = connection.cursor()
+    cursor.execute(
+        f"SELECT MIN({quote_identifier(engine, column)}) AS min_value, MAX({quote_identifier(engine, column)}) AS max_value FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+        (cutoff,),
+    )
+    row = cursor_rows(cursor)[0]
+    return row.get("min_value"), row.get("max_value")
+
+
 def age_column_candidates(job: Any) -> list[str]:
     raw = str(field(job, "retention_column", "created_at"))
     return [candidate.strip() for candidate in raw.split(",") if candidate.strip()]
@@ -456,7 +526,7 @@ def streaming_cursor(connection, engine: str, name: str):
     return cursor
 
 
-def stream_archive_rows(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, path: Path) -> tuple[str, int]:
+def stream_archive_rows(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, path: Path) -> tuple[str, int, list[str]]:
     """Write an archive in bounded batches and return its MIME type and count."""
     engine = engine_name(job)
     reference = table_reference(engine, schema, table)
@@ -470,7 +540,7 @@ def stream_archive_rows(connection, job: Any, schema: str | None, table: str, co
     first_batch = rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))
     if not first_batch:
         cursor.close()
-        return ({"parquet": "application/vnd.apache.parquet", "csv": "text/csv", "jsonl": "application/x-ndjson"}.get(archive_format, "application/octet-stream"), 0)
+        return ({"parquet": "application/vnd.apache.parquet", "csv": "text/csv", "jsonl": "application/x-ndjson"}.get(archive_format, "application/octet-stream"), 0, [])
 
     if archive_format == "parquet":
         try:
@@ -490,7 +560,7 @@ def stream_archive_rows(connection, job: Any, schema: str | None, table: str, co
         finally:
             writer.close()
             cursor.close()
-        return "application/vnd.apache.parquet", total_rows
+        return "application/vnd.apache.parquet", total_rows, list(schema.names)
 
     if archive_format == "csv":
         with path.open("w", newline="", encoding="utf-8") as handle:
@@ -503,7 +573,7 @@ def stream_archive_rows(connection, job: Any, schema: str | None, table: str, co
                 total_rows += len(batch)
                 batch = rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))
         cursor.close()
-        return "text/csv", total_rows
+        return "text/csv", total_rows, list(first_batch[0])
 
     if archive_format == "jsonl":
         with path.open("w", encoding="utf-8") as handle:
@@ -514,9 +584,66 @@ def stream_archive_rows(connection, job: Any, schema: str | None, table: str, co
                 total_rows += len(batch)
                 batch = rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))
         cursor.close()
-        return "application/x-ndjson", total_rows
+        return "application/x-ndjson", total_rows, list(first_batch[0])
 
     cursor.close()
+    raise AdapterError(f"Unsupported archive format: {archive_format}")
+
+
+def stream_mongodb_rows(collection: Any, query: dict[str, Any], path: Path, archive_format: str) -> tuple[str, int, list[str]]:
+    """Stream MongoDB documents to an archive without materializing a collection."""
+    cursor = collection.find(query).batch_size(ARCHIVE_BATCH_SIZE)
+    first = next(cursor, None)
+    if first is None:
+        return ({"parquet": "application/vnd.apache.parquet", "csv": "text/csv", "jsonl": "application/x-ndjson"}.get(archive_format.lower(), "application/octet-stream"), 0, [])
+    first_batch = [{str(key): document_value(value) for key, value in first.items()}]
+    columns = list(first_batch[0])
+    total = 0
+    archive_format = archive_format.lower()
+
+    def next_batch() -> list[dict[str, Any]]:
+        return [
+            {str(key): document_value(value) for key, value in row.items()}
+            for row in islice(cursor, ARCHIVE_BATCH_SIZE)
+        ]
+
+    if archive_format == "parquet":
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as parquet
+        except ImportError as error:
+            raise AdapterError("Parquet archive requires pyarrow from requirements.txt.") from error
+        schema = pa.Table.from_pylist(first_batch).schema
+        writer = parquet.ParquetWriter(path, schema, compression="zstd")
+        try:
+            batch = first_batch
+            while batch:
+                writer.write_table(pa.Table.from_pylist(batch, schema=schema))
+                total += len(batch)
+                batch = next_batch()
+        finally:
+            writer.close()
+        return "application/vnd.apache.parquet", total, columns
+    if archive_format == "csv":
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            batch = first_batch
+            while batch:
+                for row in batch:
+                    writer.writerow({key: "" if value is None else str(value) for key, value in row.items()})
+                total += len(batch)
+                batch = next_batch()
+        return "text/csv", total, columns
+    if archive_format == "jsonl":
+        with path.open("w", encoding="utf-8") as handle:
+            batch = first_batch
+            while batch:
+                for row in batch:
+                    handle.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
+                total += len(batch)
+                batch = next_batch()
+        return "application/x-ndjson", total, columns
     raise AdapterError(f"Unsupported archive format: {archive_format}")
 
 
@@ -546,7 +673,7 @@ def process_mongodb_job(job: Any, run_id: int, temp_dir: Path, archive: bool) ->
     if days < 1:
         client.close()
         raise AdapterError("Retention window must be at least one day.")
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     results: list[dict[str, Any]] = []
     try:
         for collection_name in collections:
@@ -557,22 +684,47 @@ def process_mongodb_job(job: Any, run_id: int, temp_dir: Path, archive: bool) ->
                 results.append({"table": collection_name, "rows": 0, "deleted": 0, "skipped": True, "message": "No configured age column found; collection skipped."})
                 continue
             query = {requested_column: {"$lt": cutoff}}
-            rows = [{str(key): document_value(value) for key, value in row.items()} for row in collection.find(query)]
-            if not rows:
+            eligible = collection.count_documents(query)
+            if not eligible:
                 results.append({"table": collection_name, "rows": 0, "deleted": 0})
                 continue
             if archive:
                 extension = (str(field(job, "archive_format", "Parquet")) or "Parquet").lower()
                 path = temp_dir / f"{slug(collection_name)}.{extension}"
-                content_type = write_archive(rows, path, str(field(job, "archive_format", "Parquet")))
-                uploaded = upload_to_r2(job, path, object_key(job, run_id, path.name), content_type)
-                uploaded.update({"format": extension, "table": collection_name, "rows": len(rows), "age_column": requested_column})
-                results.append(uploaded)
+                content_type, streamed, columns = stream_mongodb_rows(collection, query, path, extension)
+                key = data_key(job, run_id, None, collection_name, extension)
+                uploaded = upload_to_r2(job, path, key, content_type)
+                uploaded.update({"format": extension, "kind": "data", "table": collection_name, "rows": streamed, "age_column": requested_column})
+                manifest = build_manifest(
+                    job,
+                    run_id,
+                    None,
+                    collection_name,
+                    status="ready",
+                    age_column=requested_column,
+                    cutoff=cutoff,
+                    row_count=streamed,
+                    deleted_rows=0,
+                    data_object={
+                        "key": uploaded["key"], "format": extension,
+                        "content_type": content_type, "size_bytes": uploaded["size_bytes"],
+                        "etag": uploaded.get("etag"),
+                    },
+                    columns=columns,
+                    primary_keys=["_id"] if "_id" in columns else [],
+                )
+                upload_manifest(job, manifest, temp_dir)
             deleted = collection.delete_many(query).deleted_count
             if archive:
-                results[-1]["deleted"] = deleted
+                manifest["status"] = "committed"
+                manifest["deleted_rows"] = deleted
+                manifest["committed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                manifest_uploaded = upload_manifest(job, manifest, temp_dir)
+                uploaded["deleted"] = deleted
+                uploaded["manifest_key"] = manifest["manifest_key"]
+                results.extend([uploaded, manifest_uploaded])
             else:
-                results.append({"table": collection_name, "rows": len(rows), "deleted": deleted, "age_column": requested_column})
+                results.append({"table": collection_name, "rows": eligible, "deleted": deleted, "age_column": requested_column})
     finally:
         client.close()
     return results
@@ -587,7 +739,7 @@ def old_rows(connection, job: Any, schema: str | None, table: str, column: str |
     days = int(field(job, "retention_days", 730) or 730)
     if days < 1:
         raise AdapterError("Retention window must be at least one day.")
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     cursor = connection.cursor()
     cursor.execute(f"SELECT * FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}", (cutoff,))
     return column, cursor_rows(cursor), cutoff
@@ -603,7 +755,7 @@ def count_old_rows(connection, job: Any, schema: str | None, table: str, column:
     days = int(field(job, "retention_days", 730) or 730)
     if days < 1:
         raise AdapterError("Retention window must be at least one day.")
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     cursor = connection.cursor()
     cursor.execute(
         f"SELECT COUNT(*) AS row_count FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
@@ -623,7 +775,7 @@ def preview_row_job(job: Any) -> list[dict[str, Any]]:
             if not collections:
                 raise AdapterError("No MongoDB collections were found in the selected scope.")
             days = int(field(job, "retention_days", 730) or 730)
-            cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
+            cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
             requested_columns = age_column_candidates(job)
             results = []
             for name in collections:
@@ -643,7 +795,7 @@ def preview_row_job(job: Any) -> list[dict[str, Any]]:
         days = int(field(job, "retention_days", 730) or 730)
         if days < 1:
             raise AdapterError("Retention window must be at least one day.")
-        cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
         for schema, table in selected_tables(connection, job):
             column = age_column(connection, job, schema, table)
             reference = table_reference(engine, schema, table)
@@ -699,11 +851,35 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
             if not eligible:
                 results.append({"table": reference, "rows": 0, "deleted": 0})
                 continue
-            content_type, streamed = stream_archive_rows(connection, job, schema, table, column, cutoff, path)
-            key = object_key(job, run_id, path.name)
+            content_type, streamed, columns = stream_archive_rows(connection, job, schema, table, column, cutoff, path)
+            key = data_key(job, run_id, schema, table, extension)
             uploaded = upload_to_r2(job, path, key, content_type)
-            uploaded.update({"format": extension, "table": reference, "rows": streamed, "age_column": column, "cutoff": cutoff})
-            results.append(uploaded)
+            uploaded.update({"format": extension, "kind": "data", "table": reference, "rows": streamed, "age_column": column, "cutoff": cutoff})
+            min_value, max_value = archive_bounds(connection, job, schema, table, column, cutoff)
+            primary_keys = table_primary_keys(connection, job, schema, table)
+            manifest = build_manifest(
+                job,
+                run_id,
+                schema,
+                table,
+                status="ready",
+                age_column=column,
+                cutoff=cutoff,
+                row_count=streamed,
+                deleted_rows=0,
+                data_object={
+                    "key": uploaded["key"],
+                    "format": extension,
+                    "content_type": content_type,
+                    "size_bytes": uploaded["size_bytes"],
+                    "etag": uploaded.get("etag"),
+                },
+                columns=columns,
+                primary_keys=primary_keys,
+                min_value=min_value,
+                max_value=max_value,
+            )
+            manifest_uploaded = upload_manifest(job, manifest, temp_dir)
             cursor = connection.cursor()
             cursor.execute(
                 f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
@@ -711,7 +887,13 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
             )
             deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else streamed
             connection.commit()
-            results[-1]["deleted"] = deleted
+            manifest["status"] = "committed"
+            manifest["deleted_rows"] = deleted
+            manifest["committed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            manifest_uploaded = upload_manifest(job, manifest, temp_dir)
+            uploaded["deleted"] = deleted
+            uploaded["manifest_key"] = manifest["manifest_key"]
+            results.extend([uploaded, manifest_uploaded])
     except Exception:
         try:
             connection.rollback()

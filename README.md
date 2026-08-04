@@ -12,6 +12,7 @@ Flask-first control plane for universal database backups, retention and archive 
 - Direct cron override for advanced operators.
 - CRUD flows for jobs and connections, with destructive action confirmation.
 - Dry-run protection, verified R2 uploads, object ledger metrics, deleted-row counts and an activity/audit view.
+- Versioned `archives/v1/<namespace>/...` Parquet manifests. A manifest is accepted by readers only after its source deletion commits; it records source identity, table, columns, primary keys, cutoff, row counts, schema hash and R2 data objects.
 - Simple session authentication with the provided administrator credentials.
 - Authenticated JSON endpoints: `/api/health`, `/api/jobs`, and `/api/connections`.
 - Working control APIs for connection testing, search, CSV export, retention dry runs, SQLite backup, R2 settings and metrics.
@@ -52,3 +53,16 @@ For deployment, override them with `VAULTLINE_ADMIN_USERNAME`, `VAULTLINE_ADMIN_
 ## Linode deployment shape
 
 Use Gunicorn behind Nginx, keep `VAULTLINE_SECRET` in an environment file, and run `worker.py` plus cron under a restricted service account. Install the OS-level backup tools before disabling dry run. The worker verifies uploaded object size before any archive/retention delete is committed. SQL Server jobs use a compressed logical table export because native `.bak` files must be written on the SQL Server host.
+
+## Universal cold archive contract
+
+Archive jobs are project-agnostic. Set a stable **Archive namespace** such as `news-hub` on the job. The worker writes data to:
+
+```text
+archives/v1/<namespace>/<connection>/<database>/<schema>/<table>/run-<id>/data.parquet
+archives/v1/<namespace>/<connection>/<database>/<schema>/<table>/run-<id>/manifest.json
+```
+
+Consumers must import only manifests whose `status` is `committed`. The manager's SQLite `archive_manifests` table is an operational catalog; the R2 manifest is the portable source of truth, so a project can retrieve cold data without sharing Vaultline's SQLite database. News Hub imports these manifests into its own PostgreSQL `newsapi_archivemanifest` table.
+
+For large tables, use Parquet and a narrow selected-table scope. The worker streams rows in bounded batches and never loads a PostgreSQL table into process memory. Always run a dry run first and verify the first committed manifest before enabling a 14-day deletion policy.

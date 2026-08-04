@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 import tempfile
@@ -35,6 +36,7 @@ def heartbeat(run_id: int, stop: threading.Event) -> None:
         connection = None
         try:
             connection = sqlite3.connect(str(app.config["DATABASE"]), timeout=5)
+            connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute(
                 "UPDATE job_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'running'",
                 (run_id,),
@@ -119,16 +121,39 @@ def run_job(job_id: int) -> int:
                                 "INSERT INTO r2_objects (run_id, job_id, bucket, object_key, format, size_bytes, etag) VALUES (?, ?, ?, ?, ?, ?, ?)",
                                 (run_id, job["id"], uploaded["bucket"], uploaded["key"], uploaded["format"], uploaded["size_bytes"], uploaded.get("etag")),
                             )
+                        manifest = uploaded.get("manifest")
+                        if manifest:
+                            db.execute(
+                                """INSERT OR REPLACE INTO archive_manifests
+                                   (archive_id, run_id, job_id, namespace, engine, database_name, schema_name,
+                                    table_name, status, format, age_column, cutoff_value, min_value, max_value,
+                                    row_count, deleted_rows, manifest_key, data_objects_json, columns_json,
+                                    primary_keys_json, schema_hash, error_message, committed_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    manifest["archive_id"], run_id, job["id"], manifest["namespace"], manifest["engine"],
+                                    manifest["database_name"], manifest["schema_name"], manifest["table_name"],
+                                    manifest["status"], manifest["format"], manifest["age_column"], manifest["cutoff_value"],
+                                    manifest.get("min_value"), manifest.get("max_value"), manifest["row_count"],
+                                    manifest["deleted_rows"], manifest["manifest_key"], json.dumps(manifest["data_objects"]),
+                                    json.dumps(manifest["columns"]), json.dumps(manifest["primary_keys"]),
+                                    manifest["schema_hash"], manifest.get("error_message", ""), manifest.get("committed_at"),
+                                ),
+                            )
                     db.commit()
-                    total_rows = sum(int(item.get("rows", 0)) for item in results)
-                    total_deleted = sum(int(item.get("deleted", 0)) for item in results)
+                    data_results = [
+                        item for item in results
+                        if (item.get("kind") == "data") or ("kind" not in item and not item.get("skipped"))
+                    ]
+                    total_rows = sum(int(item.get("rows", 0)) for item in data_results)
+                    total_deleted = sum(int(item.get("deleted", 0)) for item in data_results)
                     skipped = sum(1 for item in results if item.get("skipped"))
                     db.execute("UPDATE job_runs SET rows_processed = ?, rows_deleted = ? WHERE id = ?", (total_rows, total_deleted, run_id))
                     db.commit()
                     if skipped:
                         event(run_id, "running", 82, f"Skipped {skipped} table(s) without a matching age column")
                     action = "Archived to R2 and removed" if archive else "Removed"
-                    processed_tables = len(results) - skipped
+                    processed_tables = len(data_results)
                     event(run_id, "running", 90, f"{action} {total_deleted} old row(s) across {processed_tables} table(s)")
                     event(run_id, "success", 100, f"{action} {total_rows} eligible row(s) successfully", finish=True)
                     return 0

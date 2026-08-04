@@ -35,9 +35,11 @@ ADMIN_PASSWORD = os.getenv("VAULTLINE_ADMIN_PASSWORD", "VaultLine@Admin12345")
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
         INSTANCE_DIR.mkdir(exist_ok=True)
-        g.db = sqlite3.connect(app.config["DATABASE"])
+        g.db = sqlite3.connect(app.config["DATABASE"], timeout=10)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys = ON")
+        g.db.execute("PRAGMA busy_timeout = 10000")
+        g.db.execute("PRAGMA journal_mode = WAL")
     return g.db
 
 
@@ -83,6 +85,7 @@ def init_db() -> None:
             tables_scope TEXT NOT NULL DEFAULT 'all',
             selected_tables TEXT,
             archive_format TEXT DEFAULT 'Parquet',
+            archive_namespace TEXT NOT NULL DEFAULT '',
             dry_run INTEGER NOT NULL DEFAULT 1,
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -136,11 +139,42 @@ def init_db() -> None:
             FOREIGN KEY (run_id) REFERENCES job_runs(id) ON DELETE CASCADE,
             FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS archive_manifests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archive_id TEXT NOT NULL UNIQUE,
+            run_id INTEGER NOT NULL,
+            job_id INTEGER NOT NULL,
+            namespace TEXT NOT NULL,
+            engine TEXT NOT NULL,
+            database_name TEXT NOT NULL,
+            schema_name TEXT,
+            table_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            format TEXT NOT NULL,
+            age_column TEXT NOT NULL,
+            cutoff_value TEXT NOT NULL,
+            min_value TEXT,
+            max_value TEXT,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            deleted_rows INTEGER NOT NULL DEFAULT 0,
+            manifest_key TEXT NOT NULL,
+            data_objects_json TEXT NOT NULL DEFAULT '[]',
+            columns_json TEXT NOT NULL DEFAULT '[]',
+            primary_keys_json TEXT NOT NULL DEFAULT '[]',
+            schema_hash TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            committed_at TEXT,
+            FOREIGN KEY (run_id) REFERENCES job_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
         """
     )
     columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
     if "retention_column" not in columns:
         db.execute("ALTER TABLE jobs ADD COLUMN retention_column TEXT NOT NULL DEFAULT 'created_at'")
+    if "archive_namespace" not in columns:
+        db.execute("ALTER TABLE jobs ADD COLUMN archive_namespace TEXT NOT NULL DEFAULT ''")
     run_columns = {row[1] for row in db.execute("PRAGMA table_info(job_runs)").fetchall()}
     if "rows_processed" not in run_columns:
         db.execute("ALTER TABLE job_runs ADD COLUMN rows_processed INTEGER NOT NULL DEFAULT 0")
@@ -380,6 +414,7 @@ def form_payload() -> dict:
         "tables_scope": request.form.get("tables_scope", "all"),
         "selected_tables": request.form.get("selected_tables", "").strip(),
         "archive_format": request.form.get("archive_format", "Parquet"),
+        "archive_namespace": request.form.get("archive_namespace", "").strip(),
         "dry_run": 1 if request.form.get("dry_run") == "on" else 0,
     }
 
