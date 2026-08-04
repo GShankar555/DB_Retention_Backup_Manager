@@ -387,12 +387,104 @@ def selected_tables(connection, job: Any) -> list[tuple[str | None, str]]:
         tables = list_tables(connection, job)
         if not tables:
             raise AdapterError("No source tables were found.")
-        return tables
+        return order_tables_for_deletion(connection, job, tables)
     raw = [value.strip() for value in str(field(job, "selected_tables", "")).split(",") if value.strip()]
     if not raw:
         raise AdapterError("Selected tables scope requires at least one table name.")
+    tables = [split_identifier(value) for value in raw]
+    return order_tables_for_deletion(connection, job, tables)
+
+
+def _table_key(engine: str, schema: str | None, table: str, job: Any) -> tuple[str, str]:
+    """Normalize implicit schemas so FK metadata matches configured tables."""
+    if engine == "postgresql":
+        return (schema or "public", table)
+    if engine in {"sqlserver", "mssql"}:
+        return (schema or "dbo", table)
+    return (str(field(job, "database_name", "")), table)
+
+
+def foreign_key_edges(connection, job: Any) -> list[tuple[tuple[str, str], tuple[str, str]]]:
+    """Return (child, parent) table edges from database FK metadata."""
     engine = engine_name(job)
-    return [(schema, table) for schema, table in (split_identifier(value) for value in raw)]
+    cursor = connection.cursor()
+    if engine == "postgresql":
+        cursor.execute(
+            """SELECT tc.table_schema AS child_schema, tc.table_name AS child_table,
+                      ccu.table_schema AS parent_schema, ccu.table_name AS parent_table
+                 FROM information_schema.table_constraints tc
+                 JOIN information_schema.constraint_column_usage ccu
+                   ON ccu.constraint_name = tc.constraint_name
+                  AND ccu.table_schema = tc.constraint_schema
+                WHERE tc.constraint_type = 'FOREIGN KEY'"""
+        )
+    elif engine in {"mysql", "mariadb"}:
+        cursor.execute(
+            """SELECT TABLE_SCHEMA AS child_schema, TABLE_NAME AS child_table,
+                      REFERENCED_TABLE_SCHEMA AS parent_schema,
+                      REFERENCED_TABLE_NAME AS parent_table
+                 FROM information_schema.KEY_COLUMN_USAGE
+                WHERE REFERENCED_TABLE_NAME IS NOT NULL
+                  AND TABLE_SCHEMA = %s""",
+            (field(job, "database_name"),),
+        )
+    elif engine in {"sqlserver", "mssql"}:
+        cursor.execute(
+            """SELECT child.TABLE_SCHEMA AS child_schema, child.TABLE_NAME AS child_table,
+                      parent.TABLE_SCHEMA AS parent_schema, parent.TABLE_NAME AS parent_table
+                 FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+                 JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS child
+                   ON child.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+                  AND child.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
+                 JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS parent
+                   ON parent.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME
+                  AND parent.CONSTRAINT_SCHEMA = rc.UNIQUE_CONSTRAINT_SCHEMA
+                WHERE child.CONSTRAINT_TYPE = 'FOREIGN KEY'"""
+        )
+    else:
+        return []
+    edges = []
+    for row in cursor_rows(cursor):
+        child = _table_key(engine, row.get("child_schema"), row.get("child_table"), job)
+        parent = _table_key(engine, row.get("parent_schema"), row.get("parent_table"), job)
+        if child != parent:
+            edges.append((child, parent))
+    return edges
+
+
+def order_tables_for_deletion(connection, job: Any, tables: list[tuple[str | None, str]]) -> list[tuple[str | None, str]]:
+    """Order selected tables child-first so FK parents are deleted last."""
+    engine = engine_name(job)
+    original = list(dict.fromkeys(tables))
+    keys = {_table_key(engine, schema, table, job): (schema, table) for schema, table in original}
+    selected = set(keys)
+    children = {key: set() for key in selected}
+    for child, parent in foreign_key_edges(connection, job):
+        if child in selected and parent in selected:
+            children[parent].add(child)
+
+    pending = set(selected)
+    ordered: list[tuple[str | None, str]] = []
+    while pending:
+        # A table with no remaining children can be removed without violating
+        # a selected-table foreign key. This produces child-before-parent order.
+        ready = [
+            _table_key(engine, schema, table, job)
+            for schema, table in original
+            if _table_key(engine, schema, table, job) in pending
+            and not (children[_table_key(engine, schema, table, job)] & pending)
+        ]
+        if not ready:
+            # Cyclic foreign keys cannot be solved by ordering alone. Preserve
+            # the configured order and let the database report the constraint.
+            ready = [
+                _table_key(engine, schema, table, job)
+                for schema, table in original
+                if _table_key(engine, schema, table, job) in pending
+            ]
+        ordered.extend(keys[key] for key in ready)
+        pending.difference_update(ready)
+    return ordered
 
 
 def table_columns(connection, job: Any, schema: str | None, table: str) -> set[str]:

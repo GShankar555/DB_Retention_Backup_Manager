@@ -65,4 +65,4 @@ archives/v1/<namespace>/<connection>/<database>/<schema>/<table>/run-<id>/manife
 
 Consumers must import only manifests whose `status` is `committed`. The manager's SQLite `archive_manifests` table is an operational catalog; the R2 manifest is the portable source of truth, so a project can retrieve cold data without sharing Vaultline's SQLite database. News Hub imports these manifests into its own PostgreSQL `newsapi_archivemanifest` table.
 
-For large tables, use Parquet and a narrow selected-table scope. The worker streams rows in bounded batches and never loads a PostgreSQL table into process memory. Always run a dry run first and verify the first committed manifest before enabling a 14-day deletion policy.
+For large tables, use Parquet and a narrow selected-table scope. The worker streams rows in bounded batches and never loads a PostgreSQL table into process memory. Row jobs inspect foreign keys and process selected tables child-first so parent deletes do not violate references. Always run a dry run first and verify the first committed manifest before enabling a 14-day deletion policy.
