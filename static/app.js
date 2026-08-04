@@ -255,6 +255,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const [hour, minute] = (runTime.value || '00:00').split(':').map(Number);
     const day = date.getDate() || 1;
     const weekday = date.getDay();
+    if (cadence.value === 'Hourly') return `${minute} * * * *`;
     if (cadence.value === 'Daily') return `${minute} ${hour} * * *`;
     if (cadence.value === 'Weekly') return `${minute} ${hour} * * ${weekday}`;
     if (cadence.value === 'Biweekly') return `${minute} ${hour} ${day} */2 *`;

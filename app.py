@@ -204,6 +204,9 @@ def build_cron(cadence: str, run_date: str, run_time: str) -> str:
         hour, minute = (int(value) for value in run_time.split(":", 1))
     except (TypeError, ValueError):
         return "0 0 * * *"
+    if cadence == "Hourly":
+        # The selected minute is retained; the hour and date are ignored.
+        return f"{minute} * * * *"
     if cadence == "Daily":
         return f"{minute} {hour} * * *"
     if cadence == "Weekly":
