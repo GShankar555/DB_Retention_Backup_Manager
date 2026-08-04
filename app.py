@@ -213,7 +213,10 @@ def build_cron(cadence: str, run_date: str, run_time: str) -> str:
         # Python uses Monday=0; cron uses Sunday=0 and Monday=1.
         return f"{minute} {hour} * * {(date.weekday() + 1) % 7}"
     if cadence == "Biweekly":
-        return f"{minute} {hour} {date.day} */2 *"
+        # Cron triggers weekly on the anchor weekday; the worker applies the
+        # 14-day anchor check because standard cron cannot express every 14
+        # days safely across month boundaries.
+        return f"{minute} {hour} * * {(date.weekday() + 1) % 7}"
     return f"{minute} {hour} {date.day} * *"
 
 
@@ -375,7 +378,7 @@ def sync_cron_file() -> tuple[bool, str]:
         ]
         for job in jobs:
             log_path = shlex.quote(str(LOG_DIR / f"job-{job['id']}.log"))
-            command = f"{job['cron_expression']} {CRON_USER} cd {workdir} && {python_bin} {worker} --job-id {job['id']} >> {log_path} 2>&1"
+            command = f"{job['cron_expression']} {CRON_USER} cd {workdir} && VAULTLINE_SCHEDULED=1 {python_bin} {worker} --job-id {job['id']} >> {log_path} 2>&1"
             lines.append(f"# {job['name']} (job {job['id']})")
             lines.append(f"CRON_TZ={valid_timezone(job['timezone'])}")
             lines.append(command)

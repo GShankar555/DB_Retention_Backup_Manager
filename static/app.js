@@ -258,7 +258,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (cadence.value === 'Hourly') return `${minute} * * * *`;
     if (cadence.value === 'Daily') return `${minute} ${hour} * * *`;
     if (cadence.value === 'Weekly') return `${minute} ${hour} * * ${weekday}`;
-    if (cadence.value === 'Biweekly') return `${minute} ${hour} ${day} */2 *`;
+    if (cadence.value === 'Biweekly') return `${minute} ${hour} * * ${weekday}`;
     return `${minute} ${hour} ${day} * *`;
   };
   const refreshCron = () => { if (!manualToggle.checked) cronPreview.textContent = getCron(); };

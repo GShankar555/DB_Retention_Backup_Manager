@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app import app, get_db, init_db
 from worker_adapters import AdapterError, create_backup_artifact, preview_row_job, process_row_job, upload_backup_artifact
@@ -50,6 +52,18 @@ def heartbeat(run_id: int, stop: threading.Event) -> None:
                 connection.close()
 
 
+def is_biweekly_due(job) -> bool:
+    """Apply the configured start-date anchor to a weekly cron trigger."""
+    if job["cadence"] != "Biweekly" or not os.getenv("VAULTLINE_SCHEDULED"):
+        return True
+    try:
+        anchor = datetime.strptime(str(job["run_date"]), "%Y-%m-%d").date()
+        today = datetime.now(ZoneInfo(str(job["timezone"] or "UTC"))).date()
+    except (TypeError, ValueError, KeyError, ZoneInfoNotFoundError):
+        return True
+    return today >= anchor and (today - anchor).days % 14 == 0
+
+
 def run_job(job_id: int) -> int:
     with app.app_context():
         init_db()
@@ -65,6 +79,9 @@ def run_job(job_id: int) -> int:
             return 2
         if not job["enabled"]:
             print(f"Vaultline job {job_id} is disabled", file=sys.stderr)
+            return 0
+        if not is_biweekly_due(job):
+            print(f"Vaultline job {job_id} is not due on this biweekly week")
             return 0
         running = db.execute("SELECT id FROM job_runs WHERE job_id = ? AND status = 'running'", (job_id,)).fetchone()
         if running:
