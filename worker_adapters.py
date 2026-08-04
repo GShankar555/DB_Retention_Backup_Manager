@@ -28,6 +28,13 @@ class AdapterError(RuntimeError):
     """An expected configuration, source, or destination failure."""
 
 
+def is_foreign_key_violation(error: Exception) -> bool:
+    """Recognize raw-SQL delete failures caused by remaining child rows."""
+    code = getattr(error, "sqlstate", None) or getattr(error, "pgcode", None)
+    message = str(error).lower()
+    return code == "23503" or "foreign key constraint" in message or "conflicted with the reference constraint" in message
+
+
 def field(row: Any, name: str, default: Any = "") -> Any:
     try:
         value = row[name]
@@ -928,12 +935,28 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
                 # the database keeps a large cleanup bounded in worker memory.
                 column, eligible, cutoff = count_old_rows(connection, job, schema, table, column)
                 cursor = connection.cursor()
-                cursor.execute(
-                    f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
-                    (cutoff,),
-                )
-                deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else eligible
-                connection.commit()
+                try:
+                    cursor.execute(
+                        f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+                        (cutoff,),
+                    )
+                    deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else eligible
+                    connection.commit()
+                except Exception as error:
+                    connection.rollback()
+                    if not is_foreign_key_violation(error):
+                        raise
+                    results.append({
+                        "kind": "deferred",
+                        "table": reference,
+                        "rows": eligible,
+                        "deleted": 0,
+                        "deferred": True,
+                        "age_column": column,
+                        "cutoff": cutoff,
+                        "message": f"Deletion deferred because newer child rows still reference this table: {str(error)[:240]}",
+                    })
+                    continue
                 results.append({"table": reference, "rows": eligible, "deleted": deleted, "age_column": column, "cutoff": cutoff})
                 continue
 
@@ -973,12 +996,40 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
             )
             manifest_uploaded = upload_manifest(job, manifest, temp_dir)
             cursor = connection.cursor()
-            cursor.execute(
-                f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
-                (cutoff,),
-            )
-            deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else streamed
-            connection.commit()
+            try:
+                cursor.execute(
+                    f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+                    (cutoff,),
+                )
+                deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else streamed
+                connection.commit()
+            except Exception as error:
+                connection.rollback()
+                if not is_foreign_key_violation(error):
+                    raise
+                manifest["error_message"] = f"Deletion deferred because newer child rows still reference this table: {str(error)[:240]}"
+                # Keep this manifest in ready state. Consumers ignore it while
+                # the source row remains hot; a later run can archive it again
+                # after its remaining child rows become eligible.
+                manifest_uploaded = upload_manifest(job, manifest, temp_dir)
+                uploaded["kind"] = "data_deferred"
+                uploaded["deleted"] = 0
+                uploaded["manifest_key"] = manifest["manifest_key"]
+                results.extend([
+                    uploaded,
+                    manifest_uploaded,
+                    {
+                        "kind": "deferred",
+                        "table": reference,
+                        "rows": streamed,
+                        "deleted": 0,
+                        "deferred": True,
+                        "age_column": column,
+                        "cutoff": cutoff,
+                        "message": manifest["error_message"],
+                    },
+                ])
+                continue
             manifest["status"] = "committed"
             manifest["deleted_rows"] = deleted
             manifest["committed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()

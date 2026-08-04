@@ -148,14 +148,18 @@ def run_job(job_id: int) -> int:
                     total_rows = sum(int(item.get("rows", 0)) for item in data_results)
                     total_deleted = sum(int(item.get("deleted", 0)) for item in data_results)
                     skipped = sum(1 for item in results if item.get("skipped"))
+                    deferred = sum(1 for item in results if item.get("deferred"))
                     db.execute("UPDATE job_runs SET rows_processed = ?, rows_deleted = ? WHERE id = ?", (total_rows, total_deleted, run_id))
                     db.commit()
                     if skipped:
                         event(run_id, "running", 82, f"Skipped {skipped} table(s) without a matching age column")
+                    if deferred:
+                        event(run_id, "running", 86, f"Deferred {deferred} table(s) with remaining foreign-key references; their ready archives remain in R2")
                     action = "Archived to R2 and removed" if archive else "Removed"
                     processed_tables = len(data_results)
                     event(run_id, "running", 90, f"{action} {total_deleted} old row(s) across {processed_tables} table(s)")
-                    event(run_id, "success", 100, f"{action} {total_rows} eligible row(s) successfully", finish=True)
+                    suffix = f"; deferred {deferred} table(s) for a later run" if deferred else ""
+                    event(run_id, "success", 100, f"{action} {total_rows} eligible row(s) successfully{suffix}", finish=True)
                     return 0
                 raise AdapterError(f"Unsupported job type: {job['job_type']}")
         except Exception as error:
