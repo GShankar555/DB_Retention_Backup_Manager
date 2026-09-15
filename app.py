@@ -576,6 +576,35 @@ def delete_job(job_id: int):
     return redirect(request.referrer or url_for("jobs"))
 
 
+@app.post("/jobs/<int:job_id>/state")
+def set_job_state(job_id: int):
+    db = get_db()
+    job = db.execute("SELECT id, name, enabled FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if job is None:
+        flash("Job not found.", "error")
+        return redirect(url_for("jobs"))
+    action = request.form.get("action")
+    if action not in {"enable", "disable"}:
+        flash("Choose enable or disable.", "error")
+        return redirect(url_for("jobs"))
+    enabled = 1 if action == "enable" else 0
+    if job["enabled"] == enabled:
+        flash(f"{job['name']} is already {action}d.", "success")
+        return redirect(url_for("jobs"))
+    db.execute("UPDATE jobs SET enabled = ? WHERE id = ?", (enabled, job_id))
+    db.commit()
+    cron_ok, cron_message = sync_cron_file()
+    if not cron_ok and enabled:
+        db.execute("UPDATE jobs SET enabled = 0 WHERE id = ?", (job_id,))
+        db.commit()
+        sync_cron_file()
+        flash(f"Job remains disabled because cron update failed: {cron_message}", "error")
+    else:
+        log_activity("Job enabled" if enabled else "Job disabled", f"{job['name']} · {cron_message}", "teal" if cron_ok else "amber")
+        flash(f"{job['name']} {action}d." if cron_ok else f"Job disabled, but cron update failed: {cron_message}", "success" if cron_ok else "error")
+    return redirect(url_for("jobs"))
+
+
 @app.route("/connections", methods=["GET", "POST"])
 def connections():
     db = get_db()
