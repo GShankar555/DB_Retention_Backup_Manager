@@ -608,6 +608,33 @@ def write_archive(rows: list[dict[str, Any]], path: Path, archive_format: str) -
 ARCHIVE_BATCH_SIZE = 1000
 
 
+def widen_null_typed_fields(schema: Any) -> tuple[Any, set[str]]:
+    """Pyarrow infers a column as its ``null`` type when every value in the
+    sampled batch is None. A later batch with a real value for that column
+    then fails with ``ArrowInvalid: Invalid null value`` because nothing
+    else can be written into a null-typed column. Widen those columns to
+    nullable strings up front so real values later in the stream fit."""
+    import pyarrow as pa
+
+    null_fields = {field.name for field in schema if pa.types.is_null(field.type)}
+    if not null_fields:
+        return schema, null_fields
+    widened = pa.schema([
+        pa.field(field.name, pa.string(), nullable=True) if field.name in null_fields else field
+        for field in schema
+    ])
+    return widened, null_fields
+
+
+def coerce_null_typed_fields(batch: list[dict[str, Any]], null_fields: set[str]) -> list[dict[str, Any]]:
+    if not null_fields:
+        return batch
+    return [
+        {key: (str(value) if key in null_fields and value is not None else value) for key, value in row.items()}
+        for row in batch
+    ]
+
+
 def streaming_cursor(connection, engine: str, name: str):
     """Return a cursor that avoids buffering the complete source table."""
     if engine == "postgresql":
@@ -649,13 +676,14 @@ def stream_archive_rows(connection, job: Any, schema: str | None, table: str, co
             cursor.close()
             raise AdapterError("Parquet archive requires pyarrow from requirements.txt.") from error
         schema = pa.Table.from_pylist(first_batch).schema
+        schema, null_fields = widen_null_typed_fields(schema)
         writer = parquet.ParquetWriter(path, schema, compression="zstd")
         try:
-            batch = first_batch
+            batch = coerce_null_typed_fields(first_batch, null_fields)
             while batch:
                 writer.write_table(pa.Table.from_pylist(batch, schema=schema))
                 total_rows += len(batch)
-                batch = rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))
+                batch = coerce_null_typed_fields(rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE)), null_fields)
         finally:
             writer.close()
             cursor.close()
@@ -713,13 +741,14 @@ def stream_mongodb_rows(collection: Any, query: dict[str, Any], path: Path, arch
         except ImportError as error:
             raise AdapterError("Parquet archive requires pyarrow from requirements.txt.") from error
         schema = pa.Table.from_pylist(first_batch).schema
+        schema, null_fields = widen_null_typed_fields(schema)
         writer = parquet.ParquetWriter(path, schema, compression="zstd")
         try:
-            batch = first_batch
+            batch = coerce_null_typed_fields(first_batch, null_fields)
             while batch:
                 writer.write_table(pa.Table.from_pylist(batch, schema=schema))
                 total += len(batch)
-                batch = next_batch()
+                batch = coerce_null_typed_fields(next_batch(), null_fields)
         finally:
             writer.close()
         return "application/vnd.apache.parquet", total, columns
