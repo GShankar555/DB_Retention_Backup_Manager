@@ -635,6 +635,24 @@ def coerce_null_typed_fields(batch: list[dict[str, Any]], null_fields: set[str])
     ]
 
 
+def json_encode_complex_values(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Postgres jsonb/array columns (dict/list values) have organically
+    varying shape row to row - AI-extracted fields especially. Letting
+    pyarrow infer a struct/list type from one sample batch is brittle: a
+    later row with different keys, nesting, or an all-null nested field
+    raises ``ArrowInvalid: Invalid null value`` or a type mismatch. Encode
+    these to compact JSON text instead, so every batch is a plain nullable
+    string column regardless of what's inside. Readers already accept a
+    JSON string here (see News Hub's ``archive.json_field``)."""
+    return [
+        {
+            key: (json.dumps(value, default=str, separators=(",", ":")) if isinstance(value, (dict, list)) else value)
+            for key, value in row.items()
+        }
+        for row in batch
+    ]
+
+
 def streaming_cursor(connection, engine: str, name: str):
     """Return a cursor that avoids buffering the complete source table."""
     if engine == "postgresql":
@@ -675,6 +693,7 @@ def stream_archive_rows(connection, job: Any, schema: str | None, table: str, co
         except ImportError as error:
             cursor.close()
             raise AdapterError("Parquet archive requires pyarrow from requirements.txt.") from error
+        first_batch = json_encode_complex_values(first_batch)
         schema = pa.Table.from_pylist(first_batch).schema
         schema, null_fields = widen_null_typed_fields(schema)
         writer = parquet.ParquetWriter(path, schema, compression="zstd")
@@ -683,7 +702,9 @@ def stream_archive_rows(connection, job: Any, schema: str | None, table: str, co
             while batch:
                 writer.write_table(pa.Table.from_pylist(batch, schema=schema))
                 total_rows += len(batch)
-                batch = coerce_null_typed_fields(rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE)), null_fields)
+                batch = coerce_null_typed_fields(
+                    json_encode_complex_values(rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))), null_fields
+                )
         finally:
             writer.close()
             cursor.close()
