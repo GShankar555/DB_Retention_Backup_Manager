@@ -172,11 +172,17 @@ def run_job(job_id: int) -> int:
                         event(run_id, "running", 82, f"Skipped {skipped} table(s) without a matching age column")
                     if deferred:
                         event(run_id, "running", 86, f"Deferred {deferred} table(s) with remaining foreign-key references; their ready archives remain in R2")
+                    empty_tables = sum(
+                        1 for item in results
+                        if not item.get("kind") and not item.get("skipped") and not int(item.get("rows", 0))
+                    )
+                    if empty_tables:
+                        event(run_id, "running", 88, f"{empty_tables} selected table(s) had no currently deletable rows")
                     action = "Archived to R2 and removed" if archive else "Removed"
-                    processed_tables = len(data_results)
+                    processed_tables = sum(1 for item in data_results if int(item.get("deleted", 0)) > 0)
                     event(run_id, "running", 90, f"{action} {total_deleted} old row(s) across {processed_tables} table(s)")
                     suffix = f"; deferred {deferred} table(s) for a later run" if deferred else ""
-                    event(run_id, "success", 100, f"{action} {total_rows} eligible row(s) successfully{suffix}", finish=True)
+                    event(run_id, "success", 100, f"{action} {total_deleted} eligible row(s) across {processed_tables} table(s) successfully{suffix}", finish=True)
                     return 0
                 raise AdapterError(f"Unsupported job type: {job['job_type']}")
         except Exception as error:
