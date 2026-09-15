@@ -19,8 +19,8 @@ jobs:
         with:
           host: ${{ vars.SERVER_IP }}
           username: ${{ vars.SERVER_NAME }}
-          password: ${{ secrets.SERVER_PASSWORD }}
-          port: 22
+          key: ${{ secrets.SSH_SERVER_KEY }}
+          port: 4224
           script: |
             set -e
 
