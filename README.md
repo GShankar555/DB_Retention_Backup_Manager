@@ -35,6 +35,8 @@ pip install -r requirements.txt
 python app.py
 ```
 
+The app and worker load `.env.development` and then `.env`; variables already set by the service take precedence. Database host, port, name and user, R2 account and bucket, job schedule, dry run and the job enabled flag are edited in the UI. Keep `DB_PASSWORD`, `ARCHIVE_R2_ACCESS_KEY` and `ARCHIVE_R2_SECRET_KEY` in the environment file. The environment password applies only when the connection's database name and user match `DB_NAME` and `DB_USER`; R2 keys apply only when a job's account and bucket match `ARCHIVE_R2_ACCOUNT_ID` and `ARCHIVE_R2_BUCKET`. For other connections or jobs, use `VAULTLINE_CONNECTION_<id>_PASSWORD` and `VAULTLINE_JOB_<id>_R2_ACCESS_KEY`/`VAULTLINE_JOB_<id>_R2_SECRET_KEY`. Existing SQLite secrets remain a compatibility fallback until removed.
+
 The connection tester and row adapter use `psycopg` for PostgreSQL, `PyMySQL` for MySQL/MariaDB, and `pymongo` for MongoDB. SQL Server testing and row operations require `pyodbc` plus Microsoft ODBC Driver 18. Full native backups additionally require `pg_dump`, `mysqldump`/`mariadb-dump`, or `mongodump` on the Linode VM.
 
 On Ubuntu/Debian, install the common native tools before creating live backup jobs:
@@ -66,7 +68,7 @@ Use Gunicorn behind Nginx, keep `VAULTLINE_SECRET` in an environment file, and r
 venv/bin/python scripts/seed_news_hub_archive.py /var/www/news-hub/backend/.env
 ```
 
-Review the created job in the UI, run a dry run, then enable it and turn dry-run off — see `deploy/archive/news-hub.md` in the News Hub repo for the exact field values this script applies. There is currently no UI control to flip a job's `enabled` flag after creation; do it directly against the SQLite store (`UPDATE jobs SET enabled = 1 WHERE id = ...`), then use **Settings → Sync now** to write the cron entry.
+Review the created job in the UI, run a dry run, then use **Enable job** and **Enable dry run** on its edit form. Use **Settings → Sync now** to write the cron entry. The seed script reads Vaultline's `.env.development` when present and stores only non-secret connection and R2 fields in SQLite; rerunning it preserves an existing job's enabled and dry-run flags.
 
 ## Universal cold archive contract
 

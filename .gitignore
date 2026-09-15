@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 instance/
 .env
+.env.*
 *.db
 dist/
 node_modules/

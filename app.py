@@ -14,10 +14,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, Response, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
+from dotenv import load_dotenv
+from secret_values import connection_password
 from worker_adapters import preview_row_job
 
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env.development", override=False)
+load_dotenv(BASE_DIR / ".env", override=False)
 INSTANCE_DIR = BASE_DIR / "instance"
 DATABASE = Path(os.getenv("VAULTLINE_DB", INSTANCE_DIR / "vaultline.db"))
 CRON_FILE = Path(os.getenv("VAULTLINE_CRON_FILE", "/etc/cron.d/vaultline"))
@@ -186,14 +190,13 @@ def init_db() -> None:
     # Seed the reusable default target from an existing configured job once.
     existing_default = db.execute("SELECT 1 FROM settings WHERE key = 'r2_account_id'").fetchone()
     if not existing_default:
-        source = db.execute("""SELECT r2_account_id, r2_bucket, r2_access_key, r2_secret_key
+        source = db.execute("""SELECT r2_account_id, r2_bucket
                               FROM jobs
                               WHERE COALESCE(r2_account_id, '') <> ''
                                  OR COALESCE(r2_bucket, '') <> ''
-                                 OR COALESCE(r2_access_key, '') <> ''
                               ORDER BY id LIMIT 1""").fetchone()
         if source:
-            for key in ("r2_account_id", "r2_bucket", "r2_access_key", "r2_secret_key"):
+            for key in ("r2_account_id", "r2_bucket"):
                 db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, source[key] or ""))
     db.commit()
 
@@ -262,7 +265,7 @@ def connection_fields(source: dict) -> dict:
         "port": port,
         "database_name": (source.get("database_name") or "").strip(),
         "username": (source.get("username") or "").strip(),
-        "password": source.get("password") or "",
+        "password": connection_password(source),
         "ssl_mode": source.get("ssl_mode", "require"),
     }
 
@@ -408,8 +411,8 @@ def form_payload() -> dict:
         "connection_id": request.form.get("connection_id", type=int),
         "r2_bucket": request.form.get("r2_bucket", "").strip(),
         "r2_account_id": request.form.get("r2_account_id", "").strip(),
-        "r2_access_key": request.form.get("r2_access_key", "").strip(),
-        "r2_secret_key": request.form.get("r2_secret_key", "").strip(),
+        "r2_access_key": "",
+        "r2_secret_key": "",
         "cadence": cadence,
         "run_date": run_date,
         "run_time": run_time,
@@ -422,6 +425,7 @@ def form_payload() -> dict:
         "archive_format": request.form.get("archive_format", "Parquet"),
         "archive_namespace": request.form.get("archive_namespace", "").strip(),
         "dry_run": 1 if request.form.get("dry_run") == "on" else 0,
+        "enabled": 1 if request.form.get("enabled") == "on" else 0,
     }
 
 
@@ -536,8 +540,6 @@ def new_job():
     form = request.form if request.method == "POST" else {
         "r2_account_id": setting_value("r2_account_id"),
         "r2_bucket": setting_value("r2_bucket") or "vaultline-prod",
-        "r2_access_key": setting_value("r2_access_key"),
-        "r2_secret_key": setting_value("r2_secret_key"),
     }
     return render_template("job_form.html", active="Jobs", connections=connections, job=None, form=form)
 
@@ -582,7 +584,7 @@ def connections():
             request.form.get("name", "").strip(), request.form.get("engine", "PostgreSQL"),
             request.form.get("host", "").strip(), request.form.get("port", type=int) or 5432,
             request.form.get("database_name", "").strip(), request.form.get("username", "").strip(),
-            request.form.get("password", ""), request.form.get("ssl_mode", "require"),
+            "", request.form.get("ssl_mode", "require"),
         )
         if not all(values[index] for index in (0, 2, 4, 5)):
             flash("Name, host, database and username are required.", "error")
@@ -621,10 +623,9 @@ def edit_connection(connection_id: int):
         if not source["name"] or not source["host"] or not source["database_name"] or not source["username"]:
             flash("Name, host, database and username are required.", "error")
         else:
-            password = source["password"] or connection["password"]
             db.execute("""UPDATE connections SET name = ?, engine = ?, host = ?, port = ?,
                          database_name = ?, username = ?, password = ?, ssl_mode = ? WHERE id = ?""",
-                       (source["name"], source["engine"], source["host"], source["port"], source["database_name"], source["username"], password, source["ssl_mode"], connection_id))
+                       (source["name"], source["engine"], source["host"], source["port"], source["database_name"], source["username"], connection["password"], source["ssl_mode"], connection_id))
             db.commit()
             log_activity("Connection updated", f"{source['name']} · configuration saved", "blue")
             flash("Database connection updated.", "success")
@@ -655,8 +656,6 @@ def settings():
         r2_account_id=setting_value("r2_account_id"),
         r2_bucket=setting_value("r2_bucket"),
         r2_endpoint=setting_value("r2_endpoint"),
-        r2_access_key=setting_value("r2_access_key"),
-        r2_secret_key=setting_value("r2_secret_key"),
         scheduler=scheduler_info(),
     )
 
@@ -873,14 +872,14 @@ def api_sqlite_backup():
 @app.route("/api/settings/r2", methods=["GET", "POST"])
 def api_r2_settings():
     db = get_db()
-    keys = ("r2_account_id", "r2_bucket", "r2_endpoint", "r2_access_key", "r2_secret_key")
+    keys = ("r2_account_id", "r2_bucket", "r2_endpoint")
     if request.method == "POST":
         source = request.get_json(silent=True) or request.form
         for key in keys:
             db.execute("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP", (key, (source.get(key) or "").strip()))
         db.commit()
         log_activity("R2 settings updated", source.get("r2_bucket") or "Default R2 target", "blue")
-    return jsonify({key: setting_value(key) for key in keys if key != "r2_secret_key"})
+    return jsonify({key: setting_value(key) for key in keys})
 
 
 if __name__ == "__main__":

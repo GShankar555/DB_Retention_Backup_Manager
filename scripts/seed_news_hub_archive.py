@@ -24,7 +24,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
-DEFAULT_ENV_PATH = BASE_DIR.parent / "news-hub" / "backend" / ".env"
+DEFAULT_ENV_PATH = (BASE_DIR / ".env.development" if (BASE_DIR / ".env.development").is_file()
+                    else BASE_DIR.parent / "news-hub" / "backend" / ".env")
 
 CONNECTION_NAME = "News Hub"
 JOB_NAME = "News Hub Cold Archive"
@@ -64,8 +65,6 @@ def main() -> int:
     port = int(env.get("DB_PORT", "5432") or 5432)
     database_name = env.get("DB_NAME", "newshub")
     username = env.get("DB_USER", "newshub")
-    password = env.get("DB_PASSWORD", "")
-
     r2_account_id = env.get("ARCHIVE_R2_ACCOUNT_ID", "")
     r2_bucket = env.get("ARCHIVE_R2_BUCKET", "")
     r2_access_key = env.get("ARCHIVE_R2_ACCESS_KEY", "")
@@ -85,14 +84,14 @@ def main() -> int:
             db.execute(
                 """UPDATE connections SET engine = ?, host = ?, port = ?, database_name = ?,
                        username = ?, password = ?, ssl_mode = ? WHERE id = ?""",
-                ("PostgreSQL", host, port, database_name, username, password, "prefer", connection_id),
+                ("PostgreSQL", host, port, database_name, username, "", "prefer", connection_id),
             )
             action_connection = "Updated"
         else:
             cursor = db.execute(
                 """INSERT INTO connections (name, engine, host, port, database_name, username, password, ssl_mode)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (CONNECTION_NAME, "PostgreSQL", host, port, database_name, username, password, "prefer"),
+                (CONNECTION_NAME, "PostgreSQL", host, port, database_name, username, "", "prefer"),
             )
             connection_id = cursor.lastrowid
             action_connection = "Created"
@@ -106,8 +105,8 @@ def main() -> int:
             "connection_id": connection_id,
             "r2_bucket": r2_bucket,
             "r2_account_id": r2_account_id,
-            "r2_access_key": r2_access_key,
-            "r2_secret_key": r2_secret_key,
+            "r2_access_key": "",
+            "r2_secret_key": "",
             "cadence": "Daily",
             "run_date": "2026-01-01",
             "run_time": "00:30",

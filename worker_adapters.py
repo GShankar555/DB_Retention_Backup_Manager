@@ -22,6 +22,7 @@ from typing import Any
 from itertools import islice
 
 from archive_contract import build_manifest, data_key, manifest_key
+from secret_values import connection_password, r2_credentials
 
 
 class AdapterError(RuntimeError):
@@ -53,7 +54,7 @@ def connection_values(job: Any) -> dict[str, Any]:
         "port": int(field(job, "port", 5432) or 5432),
         "database": field(job, "database_name"),
         "username": field(job, "username"),
-        "password": field(job, "password"),
+        "password": connection_password(job),
         "ssl_mode": field(job, "ssl_mode", "require") or "require",
     }
 
@@ -93,8 +94,8 @@ def object_key(job: Any, run_id: int, filename: str) -> str:
 
 def r2_client(job: Any):
     account_id = str(field(job, "r2_account_id", "")).strip()
-    access_key = str(field(job, "r2_access_key", "")).strip()
-    secret_key = str(field(job, "r2_secret_key", "")).strip()
+    access_key, secret_key = r2_credentials(job)
+    access_key, secret_key = access_key.strip(), secret_key.strip()
     bucket = str(field(job, "r2_bucket", "")).strip()
     if not account_id or not access_key or not secret_key or not bucket:
         raise AdapterError("R2 account ID, bucket, access key and secret key are required.")
