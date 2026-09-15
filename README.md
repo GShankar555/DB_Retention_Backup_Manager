@@ -8,7 +8,7 @@ Flask-first control plane for universal database backups, retention and archive 
 - SQLite metadata storage for database connections, jobs and activity logs.
 - Connection options for PostgreSQL, MySQL, MariaDB, SQL Server and MongoDB.
 - Three job modes: backup to Cloudflare R2, data retention, and archive old rows to Parquet in R2 before deleting them.
-- Daily, weekly, biweekly and monthly schedules, with date/time/timezone fields and generated cron expressions. Each generated entry includes `CRON_TZ`, so a 23:00 Asia/Kolkata job stays at 23:00 IST even when the VM uses UTC.
+- Daily, weekly, biweekly and monthly schedules, with date/time/timezone fields and generated cron expressions. A UTC-minute dispatcher checks each expression in its saved timezone, so a 23:00 Asia/Kolkata job runs at 23:00 IST even when the VM uses UTC.
 - Direct cron override for advanced operators.
 - CRUD flows for jobs and connections, with destructive action confirmation.
 - Dry-run protection, verified R2 uploads, object ledger metrics, deleted-row counts and an activity/audit view.
@@ -22,7 +22,7 @@ Flask-first control plane for universal database backups, retention and archive 
 
 1. **Connect:** validate source credentials with the selected database adapter and keep secrets encrypted on the Linode VM.
 2. **Preview:** query row counts, table scope and estimated bytes. Require approval for destructive jobs unless dry-run is selected.
-3. **Schedule:** job create/update/delete rewrites `/etc/cron.d/vaultline` with the saved cron expression, `CRON_TZ` and worker command. Click **Settings → Sync now** after deploying scheduler changes. Set `VAULTLINE_CRON_FILE`, `VAULTLINE_CRON_USER`, and `VAULTLINE_WORKER` when the deployment uses different paths or users.
+3. **Schedule:** job create/update/delete rewrites `/etc/cron.d/vaultline` with one minute-level entry for `scheduler.py`. The dispatcher evaluates enabled jobs against their saved cron expression and timezone, then launches due workers. Click **Settings → Sync now** after deploying scheduler changes. Set `VAULTLINE_CRON_FILE`, `VAULTLINE_CRON_USER`, `VAULTLINE_SCHEDULER`, and `VAULTLINE_WORKER` when the deployment uses different paths or users.
 4. **Execute:** native PostgreSQL, MySQL/MariaDB and MongoDB backups are uploaded to R2 through its S3-compatible API. Retention and archive jobs support PostgreSQL, MySQL/MariaDB, SQL Server and MongoDB table/collection scope; archive jobs write Parquet, CSV or JSONL before deletion.
 5. **Verify:** check object existence, size and checksum before deleting source rows. The worker run ledger now stores useful milestone status/progress events; write each stage to it and mark the job result.
 

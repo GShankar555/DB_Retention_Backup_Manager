@@ -27,6 +27,7 @@ DATABASE = Path(os.getenv("VAULTLINE_DB", INSTANCE_DIR / "vaultline.db"))
 CRON_FILE = Path(os.getenv("VAULTLINE_CRON_FILE", "/etc/cron.d/vaultline"))
 CRON_USER = os.getenv("VAULTLINE_CRON_USER", "root")
 WORKER_SCRIPT = Path(os.getenv("VAULTLINE_WORKER", BASE_DIR / "worker.py"))
+SCHEDULER_SCRIPT = Path(os.getenv("VAULTLINE_SCHEDULER", BASE_DIR / "scheduler.py"))
 LOG_DIR = Path(os.getenv("VAULTLINE_LOG_DIR", "/var/log/vaultline"))
 
 app = Flask(__name__)
@@ -333,14 +334,16 @@ def setting_value(key: str, default: str = "") -> str:
 def scheduler_info() -> dict:
     installed = CRON_FILE.exists()
     worker_exists = WORKER_SCRIPT.exists()
-    ready = installed and worker_exists
+    scheduler_exists = SCHEDULER_SCRIPT.exists()
+    ready = installed and worker_exists and scheduler_exists
     return {
         "installed": installed,
         "worker_exists": worker_exists,
         "ready": ready,
-        "label": "Ready" if ready else ("Cron installed; worker missing" if installed else "Not installed"),
+        "label": "Ready" if ready else ("Cron installed; worker or scheduler missing" if installed else "Not installed"),
         "path": str(CRON_FILE),
         "worker_path": str(WORKER_SCRIPT),
+        "scheduler_path": str(SCHEDULER_SCRIPT),
         "server_timezone": server_timezone(),
     }
 
@@ -360,7 +363,7 @@ def fetch_jobs(order: str = "DESC") -> list[sqlite3.Row]:
 
 
 def sync_cron_file() -> tuple[bool, str]:
-    """Rewrite the managed /etc/cron.d file from enabled SQLite jobs."""
+    """Install one UTC-minute dispatcher that checks each job in its own timezone."""
     db = get_db()
     jobs = db.execute("SELECT id, name, cron_expression, timezone FROM jobs WHERE enabled = 1 ORDER BY id").fetchall()
     try:
@@ -371,7 +374,7 @@ def sync_cron_file() -> tuple[bool, str]:
         CRON_FILE.parent.mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         python_bin = shlex.quote(sys.executable)
-        worker = shlex.quote(str(WORKER_SCRIPT))
+        scheduler = shlex.quote(str(SCHEDULER_SCRIPT))
         workdir = shlex.quote(str(BASE_DIR))
         lines = [
             "# Managed by Vaultline. Manual edits will be overwritten.",
@@ -379,19 +382,16 @@ def sync_cron_file() -> tuple[bool, str]:
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "",
         ]
-        for job in jobs:
-            log_path = shlex.quote(str(LOG_DIR / f"job-{job['id']}.log"))
-            command = f"{job['cron_expression']} {CRON_USER} cd {workdir} && VAULTLINE_SCHEDULED=1 {python_bin} {worker} --job-id {job['id']} >> {log_path} 2>&1"
-            lines.append(f"# {job['name']} (job {job['id']})")
-            lines.append(f"CRON_TZ={valid_timezone(job['timezone'])}")
-            lines.append(command)
+        log_path = shlex.quote(str(LOG_DIR / "scheduler.log"))
+        lines.append("# Check enabled jobs against their saved timezone each minute.")
+        lines.append(f"* * * * * {CRON_USER} cd {workdir} && {python_bin} {scheduler} >> {log_path} 2>&1")
         lines.append("")
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=CRON_FILE.parent, delete=False) as temporary:
             temporary.write("\n".join(lines))
             temporary_path = Path(temporary.name)
         os.chmod(temporary_path, 0o644)
         os.replace(temporary_path, CRON_FILE)
-        return True, f"{len(jobs)} cron job(s) installed in {CRON_FILE}."
+        return True, f"Scheduler installed for {len(jobs)} enabled job(s) in {CRON_FILE}."
     except OSError as error:
         try:
             if "temporary_path" in locals() and temporary_path.exists():
