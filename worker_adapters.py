@@ -494,6 +494,84 @@ def order_tables_for_deletion(connection, job: Any, tables: list[tuple[str | Non
     return ordered
 
 
+def referencing_columns(connection, job: Any, schema: str | None, table: str) -> list[tuple[str | None, str, str, str]]:
+    """Return (child_schema, child_table, child_fk_column, this_table_column) for
+    every foreign key anywhere in the database that references (schema, table),
+    including tables outside this job's configured scope."""
+    engine = engine_name(job)
+    cursor = connection.cursor()
+    if engine == "postgresql":
+        cursor.execute(
+            """SELECT tc.table_schema AS child_schema, tc.table_name AS child_table,
+                      kcu.column_name AS child_column, ccu.column_name AS parent_column
+                 FROM information_schema.table_constraints tc
+                 JOIN information_schema.key_column_usage kcu
+                   ON kcu.constraint_name = tc.constraint_name
+                  AND kcu.constraint_schema = tc.constraint_schema
+                 JOIN information_schema.constraint_column_usage ccu
+                   ON ccu.constraint_name = tc.constraint_name
+                  AND ccu.constraint_schema = tc.constraint_schema
+                WHERE tc.constraint_type = 'FOREIGN KEY'
+                  AND ccu.table_schema = %s AND ccu.table_name = %s""",
+            (schema or "public", table),
+        )
+    elif engine in {"mysql", "mariadb"}:
+        cursor.execute(
+            """SELECT TABLE_SCHEMA AS child_schema, TABLE_NAME AS child_table,
+                      COLUMN_NAME AS child_column, REFERENCED_COLUMN_NAME AS parent_column
+                 FROM information_schema.KEY_COLUMN_USAGE
+                WHERE REFERENCED_TABLE_SCHEMA = %s AND REFERENCED_TABLE_NAME = %s""",
+            (field(job, "database_name"), table),
+        )
+    elif engine in {"sqlserver", "mssql"}:
+        cursor.execute(
+            """SELECT child_tc.TABLE_SCHEMA AS child_schema, child_tc.TABLE_NAME AS child_table,
+                      child_kcu.COLUMN_NAME AS child_column, parent_kcu.COLUMN_NAME AS parent_column
+                 FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+                 JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS child_tc
+                   ON child_tc.CONSTRAINT_NAME = rc.CONSTRAINT_NAME AND child_tc.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
+                 JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS parent_tc
+                   ON parent_tc.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME AND parent_tc.CONSTRAINT_SCHEMA = rc.UNIQUE_CONSTRAINT_SCHEMA
+                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE child_kcu
+                   ON child_kcu.CONSTRAINT_NAME = child_tc.CONSTRAINT_NAME
+                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE parent_kcu
+                   ON parent_kcu.CONSTRAINT_NAME = parent_tc.CONSTRAINT_NAME
+                WHERE parent_tc.TABLE_SCHEMA = ? AND parent_tc.TABLE_NAME = ?""",
+            (schema or "dbo", table),
+        )
+    else:
+        return []
+    rows = cursor_rows(cursor)
+    this_key = _table_key(engine, schema, table, job)
+    return [
+        (row.get("child_schema"), row["child_table"], row["child_column"], row["parent_column"])
+        for row in rows
+        if _table_key(engine, row.get("child_schema"), row["child_table"], job) != this_key
+    ]
+
+
+def exclusion_clause(connection, job: Any, schema: str | None, table: str) -> str:
+    """Build a WHERE-clause fragment excluding rows still referenced by a row
+    elsewhere in the database. Django's on_delete=CASCADE/SET_NULL (and
+    equivalent ORM-level cascade config in other stacks) is enforced by the
+    ORM at delete time, not as a real database ON DELETE clause - so a raw
+    DELETE fails on the *entire* batch if even one candidate row is still
+    referenced, whether by a table outside this job's scope or a sibling row
+    that simply hasn't aged out yet on its own age column. Excluding those
+    rows up front lets the rest of the batch through instead of losing it
+    all to a handful of stragglers; the stragglers get swept up in a later
+    run once their own referencing rows age out too."""
+    engine = engine_name(job)
+    reference = table_reference(engine, schema, table)
+    clauses = [
+        f"NOT EXISTS (SELECT 1 FROM {table_reference(engine, child_schema, child_table)} "
+        f"WHERE {table_reference(engine, child_schema, child_table)}.{quote_identifier(engine, child_column)} "
+        f"= {reference}.{quote_identifier(engine, parent_column)})"
+        for child_schema, child_table, child_column, parent_column in referencing_columns(connection, job, schema, table)
+    ]
+    return "".join(f" AND {clause}" for clause in clauses)
+
+
 def table_columns(connection, job: Any, schema: str | None, table: str) -> set[str]:
     engine = engine_name(job)
     cursor = connection.cursor()
@@ -551,12 +629,12 @@ def table_primary_keys(connection, job: Any, schema: str | None, table: str) -> 
     return []
 
 
-def archive_bounds(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any) -> tuple[Any, Any]:
+def archive_bounds(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, extra_where: str = "") -> tuple[Any, Any]:
     engine = engine_name(job)
     reference = table_reference(engine, schema, table)
     cursor = connection.cursor()
     cursor.execute(
-        f"SELECT MIN({quote_identifier(engine, column)}) AS min_value, MAX({quote_identifier(engine, column)}) AS max_value FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+        f"SELECT MIN({quote_identifier(engine, column)}) AS min_value, MAX({quote_identifier(engine, column)}) AS max_value FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
         (cutoff,),
     )
     row = cursor_rows(cursor)[0]
@@ -670,13 +748,13 @@ def streaming_cursor(connection, engine: str, name: str):
     return cursor
 
 
-def stream_archive_rows(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, path: Path) -> tuple[str, int, list[str]]:
+def stream_archive_rows(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, path: Path, extra_where: str = "") -> tuple[str, int, list[str]]:
     """Write an archive in bounded batches and return its MIME type and count."""
     engine = engine_name(job)
     reference = table_reference(engine, schema, table)
     cursor = streaming_cursor(connection, engine, f"vaultline_archive_{slug(table)}")
     cursor.execute(
-        f"SELECT * FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+        f"SELECT * FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
         (cutoff,),
     )
     archive_format = (str(field(job, "archive_format", "Parquet")) or "Parquet").lower()
@@ -894,7 +972,7 @@ def old_rows(connection, job: Any, schema: str | None, table: str, column: str |
     return column, cursor_rows(cursor), cutoff
 
 
-def count_old_rows(connection, job: Any, schema: str | None, table: str, column: str | None = None) -> tuple[str, int, Any]:
+def count_old_rows(connection, job: Any, schema: str | None, table: str, column: str | None = None, extra_where: str = "") -> tuple[str, int, Any]:
     """Count eligible rows without materializing them in Python memory."""
     engine = engine_name(job)
     reference = table_reference(engine, schema, table)
@@ -907,7 +985,7 @@ def count_old_rows(connection, job: Any, schema: str | None, table: str, column:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     cursor = connection.cursor()
     cursor.execute(
-        f"SELECT COUNT(*) AS row_count FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+        f"SELECT COUNT(*) AS row_count FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
         (cutoff,),
     )
     row = cursor_rows(cursor)[0]
@@ -951,8 +1029,9 @@ def preview_row_job(job: Any) -> list[dict[str, Any]]:
             if not column:
                 results.append({"table": reference, "rows": 0, "age_column": None, "skipped": True, "message": "No configured age column found; table skipped."})
                 continue
+            extra_where = exclusion_clause(connection, job, schema, table)
             cursor = connection.cursor()
-            cursor.execute(f"SELECT COUNT(*) AS row_count FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}", (cutoff,))
+            cursor.execute(f"SELECT COUNT(*) AS row_count FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}", (cutoff,))
             row = cursor_rows(cursor)[0]
             results.append({"table": reference, "rows": int(row.get("row_count", row.get("COUNT(*)", 0))), "age_column": column})
     finally:
@@ -980,14 +1059,20 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
             return results
         for schema, table, column in prepared:
             reference = table_reference(engine, schema, table)
+            # A raw DELETE fails on the whole batch if even one candidate row is
+            # still referenced elsewhere (ORM-level cascade rules aren't real
+            # database ON DELETE clauses). Excluding those rows up front lets the
+            # rest of the batch through instead of losing it all to a handful of
+            # stragglers still blocked at delete time by a genuine race.
+            extra_where = exclusion_clause(connection, job, schema, table)
             if not archive:
                 # Retention does not need row contents. Counting and deleting in
                 # the database keeps a large cleanup bounded in worker memory.
-                column, eligible, cutoff = count_old_rows(connection, job, schema, table, column)
+                column, eligible, cutoff = count_old_rows(connection, job, schema, table, column, extra_where=extra_where)
                 cursor = connection.cursor()
                 try:
                     cursor.execute(
-                        f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+                        f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
                         (cutoff,),
                     )
                     deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else eligible
@@ -1012,15 +1097,15 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
 
             extension = (str(field(job, "archive_format", "Parquet")) or "Parquet").lower()
             path = temp_dir / f"{slug((schema + '.' if schema else '') + table)}.{extension}"
-            column, eligible, cutoff = count_old_rows(connection, job, schema, table, column)
+            column, eligible, cutoff = count_old_rows(connection, job, schema, table, column, extra_where=extra_where)
             if not eligible:
                 results.append({"table": reference, "rows": 0, "deleted": 0})
                 continue
-            content_type, streamed, columns = stream_archive_rows(connection, job, schema, table, column, cutoff, path)
+            content_type, streamed, columns = stream_archive_rows(connection, job, schema, table, column, cutoff, path, extra_where=extra_where)
             key = data_key(job, run_id, schema, table, extension)
             uploaded = upload_to_r2(job, path, key, content_type)
             uploaded.update({"format": extension, "kind": "data", "table": reference, "rows": streamed, "age_column": column, "cutoff": cutoff})
-            min_value, max_value = archive_bounds(connection, job, schema, table, column, cutoff)
+            min_value, max_value = archive_bounds(connection, job, schema, table, column, cutoff, extra_where=extra_where)
             primary_keys = table_primary_keys(connection, job, schema, table)
             manifest = build_manifest(
                 job,
@@ -1048,7 +1133,7 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
             cursor = connection.cursor()
             try:
                 cursor.execute(
-                    f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}",
+                    f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
                     (cutoff,),
                 )
                 deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else streamed
