@@ -52,9 +52,7 @@ For deployment, override them with `VAULTLINE_ADMIN_USERNAME`, `VAULTLINE_ADMIN_
 
 ## Linode deployment shape
 
-Use Gunicorn behind Nginx, keep `VAULTLINE_SECRET` in an environment file, and run `worker.py` plus cron under a restricted service account. Install the OS-level backup tools before disabling dry run. The worker verifies uploaded object size before any archive/retention delete is committed. SQL Server jobs use a compressed logical table export because native `.bak` files must be written on the SQL Server host.
-
-`deploy/systemd/gunicorn_vaultline.service` and `deploy/nginx/vaultline.conf` are a starting point (single checkout at `/var/www/vaultline/current`, no atomic releases yet — adapt to the release/rollback pattern used by News Hub and Newshub Brain if that matters here too). `VAULTLINE_CRON_USER` defaults to `root` because the managed jobs run native dump tools and delete rows; if the Gunicorn service account (`vaultline` in the unit above) should trigger **Settings → Sync now**, it needs write access to `/etc/cron.d/vaultline` (for example via a narrowly scoped sudoers rule), otherwise only a root-run `sync_cron_file()` (e.g. from a one-off root shell or a separate root timer) can refresh it.
+Use Gunicorn behind Nginx, keep `VAULTLINE_SECRET` in an environment file, and run `worker.py` plus cron under a restricted service account (or root, if that matches how the rest of the host is run — `VAULTLINE_CRON_USER` defaults to `root` since the managed jobs run native dump tools and delete rows, and a non-root Gunicorn account needs explicit write access to `/etc/cron.d/vaultline` before **Settings → Sync now** will work). Install the OS-level backup tools before disabling dry run. The worker verifies uploaded object size before any archive/retention delete is committed. SQL Server jobs use a compressed logical table export because native `.bak` files must be written on the SQL Server host.
 
 ### Seeding a project's connection and job
 
@@ -64,11 +62,11 @@ Use Gunicorn behind Nginx, keep `VAULTLINE_SECRET` in an environment file, and r
 # local dev
 .venv/bin/python scripts/seed_news_hub_archive.py /path/to/news-hub/backend/.env
 
-# production, after this app is deployed and R2 credentials are set in News Hub's .env
-/var/www/vaultline/current/.venv/bin/python scripts/seed_news_hub_archive.py /var/www/news-hub/backend/.env
+# production, once this app is running on the target host
+venv/bin/python scripts/seed_news_hub_archive.py /var/www/news-hub/backend/.env
 ```
 
-Review the created job in the UI, run a dry run, then enable it and turn dry-run off — see `deploy/archive/news-hub.md` in the News Hub repo for the exact field values this script applies.
+Review the created job in the UI, run a dry run, then enable it and turn dry-run off — see `deploy/archive/news-hub.md` in the News Hub repo for the exact field values this script applies. There is currently no UI control to flip a job's `enabled` flag after creation; do it directly against the SQLite store (`UPDATE jobs SET enabled = 1 WHERE id = ...`), then use **Settings → Sync now** to write the cron entry.
 
 ## Universal cold archive contract
 
