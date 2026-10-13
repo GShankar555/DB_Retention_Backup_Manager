@@ -124,6 +124,11 @@ def build_manifest(
         "columns": columns,
         "primary_keys": primary_keys or [],
         "schema_hash": schema_hash(columns),
+        "integrity": {
+            "algorithm": "sha256",
+            "verification_method": data_object.get("verification_method", ""),
+            "all_data_objects_verified": bool(data_object.get("verified")),
+        },
         "data_objects": [data_object],
         "manifest_key": manifest_key(job, run_id, schema, table),
         "created_at": now,

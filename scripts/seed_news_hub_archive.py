@@ -30,13 +30,25 @@ DEFAULT_ENV_PATH = (BASE_DIR / ".env.development" if (BASE_DIR / ".env.developme
 CONNECTION_NAME = "News Hub"
 JOB_NAME = "News Hub Cold Archive"
 
-AGE_COLUMNS = "published_at, fetched_at, started_at, timestamp, created_at"
+# First matching column per table becomes its retention clock. Include every
+# timestamp used by the shared canonical ingestion contract as well as Django's
+# application tables.
+AGE_COLUMNS = (
+    "published_at,fetched_at,started_at,timestamp,detected_at,generated_at,"
+    "asserted_at,observed_at,failed_at,finished_at,captured_at,indexed_at,"
+    "available_at,updated_at,created_at"
+)
 SELECTED_TABLES = (
-    "newsapi_articleversion,newsapi_liveupdate,newsapi_article,"
-    "newsapi_scraperun,newsapi_syncbatch"
+    # Derived search projections are disposable; mutable source/configuration,
+    # auth, queue, and archive-catalog tables remain hot. Everything below is
+    # durable historical data and is exported before deletion.
+    "quality_findings,embeddings,claims,measurements,item_entities,search_chunks,"
+    "search_documents,dead_letters,jobs,raw_objects,source_health,content_versions,"
+    "processing_runs,content_items,ingestion_runs,newsapi_articleversion,"
+    "newsapi_liveupdate,newsapi_article,newsapi_scraperun,newsapi_syncbatch"
 )
 ARCHIVE_NAMESPACE = "news-hub"
-RETENTION_DAYS = 14
+RETENTION_DAYS = 7
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -107,11 +119,11 @@ def main() -> int:
             "r2_account_id": r2_account_id,
             "r2_access_key": "",
             "r2_secret_key": "",
-            "cadence": "Daily",
+            "cadence": "Weekly",
             "run_date": "2026-01-01",
             "run_time": "00:30",
             "timezone": "Asia/Kolkata",
-            "cron_expression": "30 0 * * *",
+            "cron_expression": "30 0 * * 0",
             "retention_days": RETENTION_DAYS,
             "retention_column": AGE_COLUMNS,
             "tables_scope": "selected",

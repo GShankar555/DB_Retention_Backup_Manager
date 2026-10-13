@@ -6,36 +6,83 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: db-retention-backup-manager-production
+  cancel-in-progress: false
+
 jobs:
-  deploy:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Compile application and scripts
+        run: python -m compileall -q app.py archive_contract.py restore_drill.py scheduler.py secret_values.py worker.py worker_adapters.py scripts
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate seed scripts are inert by default
+        run: |
+          test "$(grep -c 'job_fields\["enabled"\] = 0' scripts/seed_news_hub_archive.py)" -eq 1
+          test "$(grep -c 'fields.update(name=JOB_NAME, dry_run=1, enabled=0)' scripts/seed_youtube_archive.py)" -eq 1
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Deploy to Linode via SSH
-        uses: appleboy/ssh-action@v1.2.0
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         with:
           host: ${{ vars.SERVER_IP }}
           username: ${{ vars.SERVER_NAME }}
           key: ${{ secrets.SSH_SERVER_KEY }}
           port: 4224
+          command_timeout: 20m
           script: |
-            set -e
+            set -Eeuo pipefail
 
             cd /var/www/DB_Retention_Backup_Manager
 
-            git fetch origin
-            git reset --hard origin/main
+            DEPLOY_SHA="${{ github.sha }}"
+            git fetch origin "$DEPLOY_SHA"
+            git cat-file -e "$DEPLOY_SHA^{commit}"
+            git reset --hard "$DEPLOY_SHA"
 
             source venv/bin/activate
 
             python --version
             python -m pip install --upgrade pip
             python -m pip install -r requirements.txt
+            python -m pip check
+            python -m compileall -q app.py archive_contract.py restore_drill.py scheduler.py secret_values.py worker.py worker_adapters.py scripts
 
             sudo systemctl restart gunicorn_db_manager
             sudo systemctl reload nginx
+            sudo systemctl is-active --quiet gunicorn_db_manager
+            sudo nginx -t
 
             deactivate

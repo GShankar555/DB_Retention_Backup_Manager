@@ -1,4 +1,14 @@
 document.addEventListener('DOMContentLoaded', () => {
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+  document.querySelectorAll('form[method="post" i]').forEach((form) => {
+    if (!form.querySelector('input[name="csrf_token"]')) {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'csrf_token';
+      input.value = csrfToken;
+      form.prepend(input);
+    }
+  });
   const theme = document.documentElement;
   const themeButtons = document.querySelectorAll('[data-theme-toggle]');
   const setTheme = (nextTheme) => {
@@ -29,7 +39,7 @@ document.addEventListener('DOMContentLoaded', () => {
   };
 
   const requestJSON = async (url, options = {}) => {
-    const response = await fetch(url, { headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}) }, ...options });
+    const response = await fetch(url, { headers: { Accept: 'application/json', 'X-CSRF-Token': csrfToken, ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) }, ...options });
     let data = {};
     try { data = await response.json(); } catch (_error) { data = { message: await response.text() }; }
     if (!response.ok) throw new Error(data.message || `Request failed (${response.status})`);

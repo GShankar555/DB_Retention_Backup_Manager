@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import gzip
+import hashlib
 import io
 import json
 import os
@@ -18,7 +20,7 @@ import subprocess
 import tempfile
 import tarfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from itertools import islice
 
 from archive_contract import build_manifest, data_key, manifest_key
@@ -27,6 +29,9 @@ from secret_values import connection_password, r2_credentials
 
 class AdapterError(RuntimeError):
     """An expected configuration, source, or destination failure."""
+
+
+SOURCE_OUTBOX_TABLE = "vaultline_archive_outbox"
 
 
 def is_foreign_key_violation(error: Exception) -> bool:
@@ -120,14 +125,45 @@ def r2_client(job: Any):
     return client, bucket
 
 
+def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Return a streaming SHA-256 digest without loading large archives in RAM."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class DigestWriter:
+    """File-like sink used by boto3 to hash the bytes R2 returns."""
+
+    def __init__(self) -> None:
+        self.digest = hashlib.sha256()
+        self.size = 0
+
+    def write(self, data: bytes) -> int:
+        self.digest.update(data)
+        self.size += len(data)
+        return len(data)
+
+    def hexdigest(self) -> str:
+        return self.digest.hexdigest()
+
+
 def upload_to_r2(job: Any, path: Path, key: str, content_type: str) -> dict[str, Any]:
     client, bucket = r2_client(job)
+    checksum = file_sha256(path)
+    metadata = {
+        "vaultline-job": str(field(job, "id")),
+        # S3 user-metadata keys are case-insensitive and returned lower-case.
+        "sha256": checksum,
+    }
     try:
         client.upload_file(
             str(path),
             bucket,
             key,
-            ExtraArgs={"ContentType": content_type, "Metadata": {"vaultline-job": str(field(job, "id"))}},
+            ExtraArgs={"ContentType": content_type, "Metadata": metadata},
         )
         head = client.head_object(Bucket=bucket, Key=key)
     except Exception as error:
@@ -136,7 +172,33 @@ def upload_to_r2(job: Any, path: Path, key: str, content_type: str) -> dict[str,
     actual = int(head.get("ContentLength", -1))
     if actual != expected:
         raise AdapterError(f"R2 verification failed: local size {expected} bytes, remote size {actual} bytes.")
-    return {"bucket": bucket, "key": key, "size_bytes": actual, "etag": str(head.get("ETag", "")).strip('"')}
+    remote_checksum = str((head.get("Metadata") or {}).get("sha256", "")).lower()
+    if not remote_checksum or remote_checksum != checksum:
+        raise AdapterError(
+            "R2 verification failed: the remote SHA-256 metadata does not match the uploaded file."
+        )
+    verifier = DigestWriter()
+    try:
+        # ETags are not content hashes for multipart uploads. Read the object
+        # back and hash the bytes R2 actually stored before authorizing delete.
+        client.download_fileobj(bucket, key, verifier)
+    except Exception as error:
+        raise AdapterError(f"R2 checksum read-back failed: {str(error)[:240]}") from error
+    if verifier.size != expected or verifier.hexdigest() != checksum:
+        raise AdapterError(
+            "R2 verification failed: downloaded object bytes do not match the local SHA-256."
+        )
+    return {
+        "bucket": bucket,
+        "key": key,
+        "size_bytes": actual,
+        "etag": str(head.get("ETag", "")).strip('"'),
+        "sha256": checksum,
+        "checksum_algorithm": "sha256",
+        "verified": True,
+        "verification_method": "full_object_readback_sha256",
+        "verified_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
 
 
 def upload_manifest(job: Any, manifest: dict[str, Any], temp_dir: Path) -> dict[str, Any]:
@@ -166,6 +228,90 @@ def run_command(command: list[str], destination: Path, env: dict[str, str]) -> N
         raise AdapterError(f"Database backup command failed: {detail[:280]}")
     if not destination.exists() or destination.stat().st_size == 0:
         raise AdapterError("Database backup command completed without producing a backup file.")
+
+
+def run_checked_command(command: list[str], env: dict[str, str], action: str) -> str:
+    """Run a native verification/restore command without leaking its environment."""
+    try:
+        result = subprocess.run(
+            command,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+        )
+    except OSError as error:
+        raise AdapterError(f"{action} could not start: {error}") from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "command failed").strip().replace("\n", " ")
+        raise AdapterError(f"{action} failed: {detail[:280]}")
+    return result.stdout
+
+
+def validate_backup_artifact(job: Any, path: Path) -> dict[str, Any]:
+    """Fail closed unless a backup is structurally readable by its native format.
+
+    PostgreSQL custom dumps receive the strongest check: ``pg_restore --list``
+    parses the complete table-of-contents. Other engines use their container or
+    stream integrity checks without connecting to, or mutating, a database.
+    """
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise AdapterError("Backup validation failed: artifact is missing or empty.")
+    engine = engine_name(job)
+    details: dict[str, Any] = {
+        "engine": engine,
+        "size_bytes": path.stat().st_size,
+        "sha256": file_sha256(path),
+    }
+    if engine == "postgresql":
+        utility = locate_tool("pg_restore", "VAULTLINE_PG_RESTORE")
+        if not utility:
+            raise AdapterError(
+                "PostgreSQL backup validation requires pg_restore; set "
+                "VAULTLINE_PG_RESTORE to its absolute path if cron cannot find it."
+            )
+        output = run_checked_command([utility, "--list", str(path)], os.environ.copy(), "PostgreSQL backup validation")
+        entries = sum(1 for line in output.splitlines() if line and not line.startswith(";"))
+        if entries <= 0:
+            raise AdapterError("PostgreSQL backup validation failed: pg_restore found no archive entries.")
+        details.update({"validation_method": "pg_restore_list", "archive_entries": entries})
+        return details
+    if engine in {"mysql", "mariadb"}:
+        with path.open("rb") as handle:
+            prefix = handle.read(128 * 1024)
+        if b"\x00" in prefix or not any(marker in prefix for marker in (b"-- MySQL dump", b"-- MariaDB dump", b"CREATE ", b"/*!")):
+            raise AdapterError("MySQL/MariaDB backup validation failed: artifact is not a recognizable SQL dump.")
+        details["validation_method"] = "sql_dump_header"
+        return details
+    if engine == "mongodb":
+        try:
+            expanded = 0
+            with gzip.open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    expanded += len(chunk)
+        except (OSError, EOFError) as error:
+            raise AdapterError(f"MongoDB backup validation failed: invalid gzip archive: {error}") from error
+        if expanded <= 0:
+            raise AdapterError("MongoDB backup validation failed: archive expands to zero bytes.")
+        details.update({"validation_method": "gzip_crc", "expanded_size_bytes": expanded})
+        return details
+    if engine in {"sqlserver", "mssql"}:
+        try:
+            with tarfile.open(path, "r:gz") as archive:
+                members = archive.getmembers()
+                manifest_member = next((member for member in members if member.name == "manifest.json"), None)
+                if manifest_member is None:
+                    raise AdapterError("SQL Server backup validation failed: manifest.json is missing.")
+                handle = archive.extractfile(manifest_member)
+                manifest = json.load(handle) if handle else {}
+        except (tarfile.TarError, OSError, json.JSONDecodeError) as error:
+            raise AdapterError(f"SQL Server backup validation failed: {error}") from error
+        if manifest.get("type") != "sqlserver-logical-export":
+            raise AdapterError("SQL Server backup validation failed: unexpected manifest type.")
+        details.update({"validation_method": "tar_manifest", "tables": len(manifest.get("tables", []))})
+        return details
+    raise AdapterError(f"Backup validation is unavailable for engine: {field(job, 'engine')}")
 
 
 def create_native_backup(job: Any, destination: Path) -> tuple[str, str]:
@@ -248,6 +394,7 @@ def create_backup_artifact(job: Any, temp_dir: Path) -> tuple[Path, str]:
     filename = f"{slug(str(field(job, 'database_name', 'database')))}{extension}"
     destination = temp_dir / filename
     generated, content_type = create_native_backup(job, destination)
+    validate_backup_artifact(job, destination)
     return destination, content_type
 
 
@@ -257,6 +404,131 @@ def upload_backup_artifact(job: Any, run_id: int, path: Path, content_type: str)
     result = upload_to_r2(job, path, key, content_type)
     result["format"] = generated.rsplit(".", 1)[-1]
     return result
+
+
+def download_r2_object(
+    job: Any,
+    key: str,
+    destination: Path,
+    *,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Download an R2 object and independently verify its ledger checksum."""
+    client, bucket = r2_client(job)
+    try:
+        head = client.head_object(Bucket=bucket, Key=key)
+        with destination.open("wb") as handle:
+            client.download_fileobj(bucket, key, handle)
+    except Exception as error:
+        destination.unlink(missing_ok=True)
+        raise AdapterError(f"R2 restore download failed: {str(error)[:240]}") from error
+    actual_size = destination.stat().st_size
+    ledger_size = int(expected_size) if expected_size is not None else int(head.get("ContentLength", -1))
+    if ledger_size >= 0 and actual_size != ledger_size:
+        raise AdapterError(
+            f"R2 restore verification failed: expected {ledger_size} bytes, downloaded {actual_size} bytes."
+        )
+    actual_sha256 = file_sha256(destination)
+    ledger_sha256 = str(expected_sha256 or (head.get("Metadata") or {}).get("sha256", "")).lower()
+    if not ledger_sha256:
+        raise AdapterError("R2 restore verification failed: no trusted SHA-256 is available.")
+    if actual_sha256 != ledger_sha256:
+        raise AdapterError("R2 restore verification failed: downloaded SHA-256 does not match the ledger.")
+    return {
+        "bucket": bucket,
+        "key": key,
+        "size_bytes": actual_size,
+        "sha256": actual_sha256,
+        "verified_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+
+def restore_postgresql_backup(job: Any, path: Path, target_database: str) -> dict[str, Any]:
+    """Restore into an operator-created, empty PostgreSQL drill database."""
+    if not IDENTIFIER.fullmatch(target_database):
+        raise AdapterError("Restore target must be a simple PostgreSQL database identifier.")
+    source_database = str(field(job, "database_name", ""))
+    if target_database == source_database:
+        raise AdapterError("Restore refused: the drill target must not be the source database.")
+    values = connection_values(job)
+    try:
+        import psycopg
+        target = psycopg.connect(
+            host=values["host"],
+            port=values["port"],
+            dbname=target_database,
+            user=values["username"],
+            password=values["password"],
+            sslmode=values["ssl_mode"],
+            connect_timeout=15,
+        )
+    except ImportError as error:
+        raise AdapterError("PostgreSQL restore drill requires psycopg.") from error
+    except Exception as error:
+        raise AdapterError(f"Could not connect to PostgreSQL restore target: {str(error)[:240]}") from error
+    try:
+        with target.cursor() as cursor:
+            cursor.execute(
+                """SELECT COUNT(*)
+                     FROM pg_catalog.pg_class c
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S')
+                      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                      AND n.nspname !~ '^pg_toast'"""
+            )
+            existing = int(cursor.fetchone()[0])
+        if existing:
+            raise AdapterError(
+                f"Restore refused: target database {target_database} contains {existing} user object(s)."
+            )
+    finally:
+        target.close()
+    utility = locate_tool("pg_restore", "VAULTLINE_PG_RESTORE")
+    if not utility:
+        raise AdapterError("PostgreSQL restore drill requires pg_restore.")
+    env = os.environ.copy()
+    env["PGPASSWORD"] = str(values["password"])
+    env["PGSSLMODE"] = str(values["ssl_mode"])
+    env["PGCONNECT_TIMEOUT"] = "15"
+    command = [
+        utility,
+        "--host", str(values["host"]),
+        "--port", str(values["port"]),
+        "--username", str(values["username"]),
+        "--dbname", target_database,
+        "--no-owner",
+        "--no-acl",
+        "--exit-on-error",
+        str(path),
+    ]
+    run_checked_command(command, env, "PostgreSQL restore drill")
+    try:
+        target = psycopg.connect(
+            host=values["host"], port=values["port"], dbname=target_database,
+            user=values["username"], password=values["password"],
+            sslmode=values["ssl_mode"], connect_timeout=15,
+        )
+        with target.cursor() as cursor:
+            cursor.execute(
+                """SELECT COUNT(*)
+                     FROM pg_catalog.pg_class c
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relkind IN ('r', 'p')
+                      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                      AND n.nspname !~ '^pg_toast'"""
+            )
+            restored_relations = int(cursor.fetchone()[0])
+    except Exception as error:
+        raise AdapterError(f"Restore completed but validation query failed: {str(error)[:240]}") from error
+    finally:
+        try:
+            target.close()
+        except Exception:
+            pass
+    if restored_relations <= 0:
+        raise AdapterError("Restore drill failed: no user tables were found in the target database.")
+    return {"target_database": target_database, "restored_relations": restored_relations}
 
 
 def backup_database(job: Any, run_id: int, temp_dir: Path) -> dict[str, Any]:
@@ -378,7 +650,11 @@ def list_tables(connection, job: Any) -> list[tuple[str | None, str]]:
     if engine == "postgresql":
         cursor.execute("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name")
         rows = cursor_rows(cursor)
-        return [(row["table_schema"], row["table_name"]) for row in rows]
+        return [
+            (row["table_schema"], row["table_name"])
+            for row in rows
+            if row["table_name"] != SOURCE_OUTBOX_TABLE
+        ]
     if engine in {"mysql", "mariadb"}:
         cursor.execute("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
         rows = cursor_rows(cursor)
@@ -496,7 +772,11 @@ def order_tables_for_deletion(connection, job: Any, tables: list[tuple[str | Non
 
 
 def referencing_columns(connection, job: Any, schema: str | None, table: str) -> list[tuple[str | None, str, str, str]]:
-    """Return (child_schema, child_table, child_fk_column, this_table_column) for
+    """Return blocking (child schema/table/column, parent column) references.
+
+    CASCADE and SET NULL constraints safely resolve themselves during DELETE;
+    only NO ACTION/RESTRICT-style references must exclude a candidate row.
+    Return (child_schema, child_table, child_fk_column, this_table_column) for
     every foreign key anywhere in the database that references (schema, table),
     including tables outside this job's configured scope."""
     engine = engine_name(job)
@@ -504,8 +784,12 @@ def referencing_columns(connection, job: Any, schema: str | None, table: str) ->
     if engine == "postgresql":
         cursor.execute(
             """SELECT tc.table_schema AS child_schema, tc.table_name AS child_table,
-                      kcu.column_name AS child_column, ccu.column_name AS parent_column
+                      kcu.column_name AS child_column, ccu.column_name AS parent_column,
+                      rc.delete_rule AS delete_rule
                  FROM information_schema.table_constraints tc
+                 JOIN information_schema.referential_constraints rc
+                   ON rc.constraint_name = tc.constraint_name
+                  AND rc.constraint_schema = tc.constraint_schema
                  JOIN information_schema.key_column_usage kcu
                    ON kcu.constraint_name = tc.constraint_name
                   AND kcu.constraint_schema = tc.constraint_schema
@@ -518,16 +802,21 @@ def referencing_columns(connection, job: Any, schema: str | None, table: str) ->
         )
     elif engine in {"mysql", "mariadb"}:
         cursor.execute(
-            """SELECT TABLE_SCHEMA AS child_schema, TABLE_NAME AS child_table,
-                      COLUMN_NAME AS child_column, REFERENCED_COLUMN_NAME AS parent_column
-                 FROM information_schema.KEY_COLUMN_USAGE
+            """SELECT k.TABLE_SCHEMA AS child_schema, k.TABLE_NAME AS child_table,
+                      k.COLUMN_NAME AS child_column, k.REFERENCED_COLUMN_NAME AS parent_column,
+                      rc.DELETE_RULE AS delete_rule
+                 FROM information_schema.KEY_COLUMN_USAGE k
+                 JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
+                   ON rc.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA
+                  AND rc.CONSTRAINT_NAME = k.CONSTRAINT_NAME
                 WHERE REFERENCED_TABLE_SCHEMA = %s AND REFERENCED_TABLE_NAME = %s""",
             (field(job, "database_name"), table),
         )
     elif engine in {"sqlserver", "mssql"}:
         cursor.execute(
             """SELECT child_tc.TABLE_SCHEMA AS child_schema, child_tc.TABLE_NAME AS child_table,
-                      child_kcu.COLUMN_NAME AS child_column, parent_kcu.COLUMN_NAME AS parent_column
+                      child_kcu.COLUMN_NAME AS child_column, parent_kcu.COLUMN_NAME AS parent_column,
+                      rc.DELETE_RULE AS delete_rule
                  FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
                  JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS child_tc
                    ON child_tc.CONSTRAINT_NAME = rc.CONSTRAINT_NAME AND child_tc.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
@@ -548,20 +837,15 @@ def referencing_columns(connection, job: Any, schema: str | None, table: str) ->
         (row.get("child_schema"), row["child_table"], row["child_column"], row["parent_column"])
         for row in rows
         if _table_key(engine, row.get("child_schema"), row["child_table"], job) != this_key
+        and str(row.get("delete_rule", "NO ACTION")).upper() not in {"CASCADE", "SET NULL"}
     ]
 
 
 def exclusion_clause(connection, job: Any, schema: str | None, table: str) -> str:
     """Build a WHERE-clause fragment excluding rows still referenced by a row
-    elsewhere in the database. Django's on_delete=CASCADE/SET_NULL (and
-    equivalent ORM-level cascade config in other stacks) is enforced by the
-    ORM at delete time, not as a real database ON DELETE clause - so a raw
-    DELETE fails on the *entire* batch if even one candidate row is still
-    referenced, whether by a table outside this job's scope or a sibling row
-    that simply hasn't aged out yet on its own age column. Excluding those
-    rows up front lets the rest of the batch through instead of losing it
-    all to a handful of stragglers; the stragglers get swept up in a later
-    run once their own referencing rows age out too."""
+    elsewhere in the database by a NO ACTION/RESTRICT constraint. Database
+    CASCADE and SET NULL references are intentionally omitted because the
+    database resolves them atomically with the parent DELETE."""
     engine = engine_name(job)
     reference = table_reference(engine, schema, table)
     clauses = [
@@ -583,6 +867,47 @@ def table_columns(connection, job: Any, schema: str | None, table: str) -> set[s
     else:
         cursor.execute("SELECT COLUMN_NAME AS column_name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", (schema or "dbo", table))
     return {str(row["column_name"] if "column_name" in row else row["COLUMN_NAME"]) for row in cursor_rows(cursor)}
+
+
+def retention_cutoff(connection, job: Any, schema: str | None, table: str, column: str, days: int) -> Any:
+    """Return a cutoff compatible with the source column's physical type.
+
+    The YouTube project's legacy tables store ISO-8601 timestamps as TEXT,
+    while the canonical tables use TIMESTAMPTZ. PostgreSQL does not implicitly
+    compare those text columns with a Python datetime parameter.
+    """
+    now = dt.datetime.now(dt.timezone.utc)
+    # hot_until is already the absolute lifecycle boundary written by the
+    # producers. Subtracting the configured window a second time would keep
+    # rows hot for fourteen days instead of seven.
+    cutoff = now if column.lower() == "hot_until" else now - dt.timedelta(days=days)
+    engine = engine_name(job)
+    cursor = connection.cursor()
+    if engine == "postgresql":
+        cursor.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+            (schema or "public", table, column),
+        )
+    elif engine in {"mysql", "mariadb"}:
+        cursor.execute(
+            "SELECT DATA_TYPE AS data_type FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+            (field(job, "database_name"), table, column),
+        )
+    else:
+        cursor.execute(
+            "SELECT DATA_TYPE AS data_type FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+            (schema or "dbo", table, column),
+        )
+    rows = cursor_rows(cursor)
+    data_type = str(rows[0].get("data_type", "")).lower() if rows else ""
+    if data_type in {"text", "character varying", "character", "varchar", "nvarchar"}:
+        return cutoff.date().isoformat() if column.lower() == "day" else cutoff.isoformat()
+    if data_type == "date":
+        return cutoff.date()
+    return cutoff
 
 
 def table_primary_keys(connection, job: Any, schema: str | None, table: str) -> list[str]:
@@ -630,14 +955,81 @@ def table_primary_keys(connection, job: Any, schema: str | None, table: str) -> 
     return []
 
 
-def archive_bounds(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, extra_where: str = "") -> tuple[Any, Any]:
+def postgres_candidate_table(run_id: int, schema: str | None, table: str) -> str:
+    """Return a short, quoted session-local table name for one archive set."""
+    identity = f"{run_id}|{schema or 'public'}|{table}".encode("utf-8")
+    suffix = hashlib.sha256(identity).hexdigest()[:16]
+    return quote_identifier("postgresql", f"vaultline_keys_{suffix}")
+
+
+def lock_postgres_candidates(
+    connection,
+    job: Any,
+    run_id: int,
+    schema: str | None,
+    table: str,
+    column: str,
+    cutoff: Any,
+    extra_where: str,
+    primary_keys: list[str],
+) -> tuple[str, int]:
+    """Lock and materialize the exact PostgreSQL primary-key set to archive.
+
+    The row locks remain held until the per-table transaction commits. This
+    prevents rows being updated/deleted between serialization and deletion,
+    while the temporary identity table prevents newly eligible rows from being
+    swept into the later DELETE.
+    """
+    if not primary_keys:
+        raise AdapterError(
+            f"Archive refused for {table_reference('postgresql', schema, table)}: "
+            "a primary key is required for exact-set verification."
+        )
+    reference = table_reference("postgresql", schema, table)
+    candidate_table = postgres_candidate_table(run_id, schema, table)
+    keys = ", ".join(quote_identifier("postgresql", key) for key in primary_keys)
+    cursor = connection.cursor()
+    cursor.execute(
+        f"CREATE TEMP TABLE {candidate_table} ON COMMIT DROP AS "
+        f"SELECT {keys} FROM {reference} WHERE FALSE"
+    )
+    cursor.execute(
+        f"WITH locked_rows AS ("
+        f"SELECT {keys} FROM {reference} "
+        f"WHERE {quote_identifier('postgresql', column)} < %s{extra_where} "
+        f"FOR UPDATE SKIP LOCKED"
+        f") INSERT INTO {candidate_table} ({keys}) SELECT {keys} FROM locked_rows",
+        (cutoff,),
+    )
+    cursor.execute(f"SELECT COUNT(*) AS row_count FROM {candidate_table}")
+    count = int(cursor_rows(cursor)[0]["row_count"])
+    return candidate_table, count
+
+
+def postgres_identity_join(primary_keys: list[str], source_alias: str = "source", key_alias: str = "candidate_keys") -> str:
+    return " AND ".join(
+        f"{source_alias}.{quote_identifier('postgresql', key)} = "
+        f"{key_alias}.{quote_identifier('postgresql', key)}"
+        for key in primary_keys
+    )
+
+
+def archive_bounds(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, extra_where: str = "", *, candidate_table: str | None = None, primary_keys: list[str] | None = None) -> tuple[Any, Any]:
     engine = engine_name(job)
     reference = table_reference(engine, schema, table)
     cursor = connection.cursor()
-    cursor.execute(
-        f"SELECT MIN({quote_identifier(engine, column)}) AS min_value, MAX({quote_identifier(engine, column)}) AS max_value FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
-        (cutoff,),
-    )
+    if candidate_table:
+        join = postgres_identity_join(primary_keys or [])
+        cursor.execute(
+            f"SELECT MIN(source.{quote_identifier(engine, column)}) AS min_value, "
+            f"MAX(source.{quote_identifier(engine, column)}) AS max_value "
+            f"FROM {reference} AS source JOIN {candidate_table} AS candidate_keys ON {join}"
+        )
+    else:
+        cursor.execute(
+            f"SELECT MIN({quote_identifier(engine, column)}) AS min_value, MAX({quote_identifier(engine, column)}) AS max_value FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
+            (cutoff,),
+        )
     row = cursor_rows(cursor)[0]
     return row.get("min_value"), row.get("max_value")
 
@@ -749,15 +1141,22 @@ def streaming_cursor(connection, engine: str, name: str):
     return cursor
 
 
-def stream_archive_rows(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, path: Path, extra_where: str = "") -> tuple[str, int, list[str]]:
+def stream_archive_rows(connection, job: Any, schema: str | None, table: str, column: str, cutoff: Any, path: Path, extra_where: str = "", *, candidate_table: str | None = None, primary_keys: list[str] | None = None) -> tuple[str, int, list[str]]:
     """Write an archive in bounded batches and return its MIME type and count."""
     engine = engine_name(job)
     reference = table_reference(engine, schema, table)
     cursor = streaming_cursor(connection, engine, f"vaultline_archive_{slug(table)}")
-    cursor.execute(
-        f"SELECT * FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
-        (cutoff,),
-    )
+    if candidate_table:
+        join = postgres_identity_join(primary_keys or [])
+        cursor.execute(
+            f"SELECT source.* FROM {reference} AS source "
+            f"JOIN {candidate_table} AS candidate_keys ON {join}"
+        )
+    else:
+        cursor.execute(
+            f"SELECT * FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
+            (cutoff,),
+        )
     archive_format = (str(field(job, "archive_format", "Parquet")) or "Parquet").lower()
     total_rows = 0
     first_batch = rows_from_values(cursor, cursor.fetchmany(ARCHIVE_BATCH_SIZE))
@@ -897,7 +1296,7 @@ def process_mongodb_job(job: Any, run_id: int, temp_dir: Path, archive: bool) ->
         client.close()
         raise AdapterError("No MongoDB collections were found in the selected scope.")
     requested_columns = age_column_candidates(job)
-    days = int(field(job, "retention_days", 730) or 730)
+    days = int(field(job, "retention_days", 7) or 7)
     if days < 1:
         client.close()
         raise AdapterError("Retention window must be at least one day.")
@@ -937,6 +1336,11 @@ def process_mongodb_job(job: Any, run_id: int, temp_dir: Path, archive: bool) ->
                         "key": uploaded["key"], "format": extension,
                         "content_type": content_type, "size_bytes": uploaded["size_bytes"],
                         "etag": uploaded.get("etag"),
+                        "sha256": uploaded["sha256"],
+                        "checksum_algorithm": uploaded["checksum_algorithm"],
+                        "verified": uploaded["verified"],
+                        "verification_method": uploaded["verification_method"],
+                        "verified_at": uploaded["verified_at"],
                     },
                     columns=columns,
                     primary_keys=["_id"] if "_id" in columns else [],
@@ -964,10 +1368,10 @@ def old_rows(connection, job: Any, schema: str | None, table: str, column: str |
     column = column or age_column(connection, job, schema, table)
     if not column:
         raise AdapterError(f"No configured age column was found on {reference}.")
-    days = int(field(job, "retention_days", 730) or 730)
+    days = int(field(job, "retention_days", 7) or 7)
     if days < 1:
         raise AdapterError("Retention window must be at least one day.")
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    cutoff = retention_cutoff(connection, job, schema, table, column, days)
     cursor = connection.cursor()
     cursor.execute(f"SELECT * FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}", (cutoff,))
     return column, cursor_rows(cursor), cutoff
@@ -980,10 +1384,10 @@ def count_old_rows(connection, job: Any, schema: str | None, table: str, column:
     column = column or age_column(connection, job, schema, table)
     if not column:
         raise AdapterError(f"No configured age column was found on {reference}.")
-    days = int(field(job, "retention_days", 730) or 730)
+    days = int(field(job, "retention_days", 7) or 7)
     if days < 1:
         raise AdapterError("Retention window must be at least one day.")
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    cutoff = retention_cutoff(connection, job, schema, table, column, days)
     cursor = connection.cursor()
     cursor.execute(
         f"SELECT COUNT(*) AS row_count FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
@@ -1002,7 +1406,7 @@ def preview_row_job(job: Any) -> list[dict[str, Any]]:
             collections = database.list_collection_names() if field(job, "tables_scope", "all") == "all" else [value.strip() for value in str(field(job, "selected_tables", "")).split(",") if value.strip()]
             if not collections:
                 raise AdapterError("No MongoDB collections were found in the selected scope.")
-            days = int(field(job, "retention_days", 730) or 730)
+            days = int(field(job, "retention_days", 7) or 7)
             cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
             requested_columns = age_column_candidates(job)
             results = []
@@ -1020,16 +1424,16 @@ def preview_row_job(job: Any) -> list[dict[str, Any]]:
     engine = engine_name(job)
     results: list[dict[str, Any]] = []
     try:
-        days = int(field(job, "retention_days", 730) or 730)
+        days = int(field(job, "retention_days", 7) or 7)
         if days < 1:
             raise AdapterError("Retention window must be at least one day.")
-        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
         for schema, table in selected_tables(connection, job):
             column = age_column(connection, job, schema, table)
             reference = table_reference(engine, schema, table)
             if not column:
                 results.append({"table": reference, "rows": 0, "age_column": None, "skipped": True, "message": "No configured age column found; table skipped."})
                 continue
+            cutoff = retention_cutoff(connection, job, schema, table, column, days)
             extra_where = exclusion_clause(connection, job, schema, table)
             cursor = connection.cursor()
             cursor.execute(f"SELECT COUNT(*) AS row_count FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}", (cutoff,))
@@ -1040,13 +1444,90 @@ def preview_row_job(job: Any) -> list[dict[str, Any]]:
     return results
 
 
-def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> list[dict[str, Any]]:
-    if engine_name(job) == "mongodb":
-        return process_mongodb_job(job, run_id, temp_dir, archive)
+def ensure_source_outbox(connection) -> None:
+    """Create the PostgreSQL recovery outbox used by archive DELETE commits."""
+    cursor = connection.cursor()
+    cursor.execute(
+        f"""CREATE TABLE IF NOT EXISTS public.{SOURCE_OUTBOX_TABLE} (
+                archive_id TEXT PRIMARY KEY,
+                manifest JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )"""
+    )
+    connection.commit()
+
+
+def write_source_outbox(connection, manifest: dict[str, Any]) -> None:
+    cursor = connection.cursor()
+    cursor.execute(
+        f"""INSERT INTO public.{SOURCE_OUTBOX_TABLE} (archive_id, manifest)
+            VALUES (%s, %s::jsonb)
+            ON CONFLICT (archive_id) DO UPDATE SET manifest = EXCLUDED.manifest""",
+        (manifest["archive_id"], json.dumps(manifest, default=str, sort_keys=True)),
+    )
+
+
+def delete_source_outbox(connection, archive_id: str) -> None:
+    cursor = connection.cursor()
+    cursor.execute(
+        f"DELETE FROM public.{SOURCE_OUTBOX_TABLE} WHERE archive_id = %s",
+        (archive_id,),
+    )
+    connection.commit()
+
+
+def recover_source_outbox(
+    connection,
+    job: Any,
+    temp_dir: Path,
+    archive_state_callback: Callable[[dict[str, Any]], None] | None,
+) -> int:
+    """Finish manifest promotion after an atomically committed source delete."""
+    ensure_source_outbox(connection)
+    cursor = connection.cursor()
+    cursor.execute(
+        f"SELECT archive_id, manifest FROM public.{SOURCE_OUTBOX_TABLE} ORDER BY created_at, archive_id"
+    )
+    rows = cursor_rows(cursor)
+    recovered = 0
+    for row in rows:
+        payload = row["manifest"]
+        manifest = json.loads(payload) if isinstance(payload, str) else dict(payload)
+        if manifest.get("status") != "source_delete_committed":
+            raise AdapterError(
+                f"Source outbox archive {row['archive_id']} has an invalid state; refusing to discard it."
+            )
+        if archive_state_callback:
+            archive_state_callback(manifest)
+        manifest["status"] = "committed"
+        manifest["committed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        upload_manifest(job, manifest, temp_dir)
+        if archive_state_callback:
+            archive_state_callback(manifest)
+        delete_source_outbox(connection, str(row["archive_id"]))
+        recovered += 1
+    return recovered
+
+
+def process_row_job(
+    job: Any,
+    run_id: int,
+    temp_dir: Path,
+    archive: bool,
+    archive_state_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    engine = engine_name(job)
+    if engine != "postgresql":
+        raise AdapterError(
+            "Live archive/retention deletion is currently supported only for PostgreSQL, "
+            "where Vaultline locks an exact primary-key set. Use dry-run preview or a full "
+            "backup for MongoDB, MySQL/MariaDB, and SQL Server."
+        )
     connection = connect_database(job)
     results: list[dict[str, Any]] = []
-    engine = engine_name(job)
     try:
+        if archive:
+            recover_source_outbox(connection, job, temp_dir, archive_state_callback)
         tables = selected_tables(connection, job)
         prepared = []
         for schema, table in tables:
@@ -1069,14 +1550,48 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
             if not archive:
                 # Retention does not need row contents. Counting and deleting in
                 # the database keeps a large cleanup bounded in worker memory.
-                column, eligible, cutoff = count_old_rows(connection, job, schema, table, column, extra_where=extra_where)
+                candidate_table = None
+                primary_keys: list[str] = []
+                if engine == "postgresql":
+                    days = int(field(job, "retention_days", 7) or 7)
+                    if days < 1:
+                        raise AdapterError("Retention window must be at least one day.")
+                    cutoff = retention_cutoff(connection, job, schema, table, column, days)
+                    primary_keys = table_primary_keys(connection, job, schema, table)
+                    candidate_table, eligible = lock_postgres_candidates(
+                        connection,
+                        job,
+                        run_id,
+                        schema,
+                        table,
+                        column,
+                        cutoff,
+                        extra_where,
+                        primary_keys,
+                    )
+                else:
+                    column, eligible, cutoff = count_old_rows(
+                        connection, job, schema, table, column, extra_where=extra_where
+                    )
                 cursor = connection.cursor()
                 try:
-                    cursor.execute(
-                        f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
-                        (cutoff,),
-                    )
+                    if candidate_table:
+                        join = postgres_identity_join(primary_keys)
+                        cursor.execute(
+                            f"DELETE FROM {reference} AS source USING {candidate_table} AS candidate_keys "
+                            f"WHERE {join}"
+                        )
+                    else:
+                        cursor.execute(
+                            f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
+                            (cutoff,),
+                        )
                     deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else eligible
+                    if deleted != eligible:
+                        raise AdapterError(
+                            f"Retention/delete mismatch for {reference}: selected {eligible} row(s) "
+                            f"but DELETE matched {deleted}. Transaction rolled back."
+                        )
                     connection.commit()
                 except Exception as error:
                     connection.rollback()
@@ -1098,16 +1613,66 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
 
             extension = (str(field(job, "archive_format", "Parquet")) or "Parquet").lower()
             path = temp_dir / f"{slug((schema + '.' if schema else '') + table)}.{extension}"
-            column, eligible, cutoff = count_old_rows(connection, job, schema, table, column, extra_where=extra_where)
+            days = int(field(job, "retention_days", 7) or 7)
+            if days < 1:
+                raise AdapterError("Retention window must be at least one day.")
+            cutoff = retention_cutoff(connection, job, schema, table, column, days)
+            primary_keys = table_primary_keys(connection, job, schema, table)
+            candidate_table = None
+            if engine == "postgresql":
+                candidate_table, eligible = lock_postgres_candidates(
+                    connection,
+                    job,
+                    run_id,
+                    schema,
+                    table,
+                    column,
+                    cutoff,
+                    extra_where,
+                    primary_keys,
+                )
+            else:
+                column, eligible, cutoff = count_old_rows(
+                    connection, job, schema, table, column, extra_where=extra_where
+                )
             if not eligible:
+                # End the PostgreSQL per-table transaction and release any
+                # candidate locks/temp state before moving to the next table.
+                connection.commit()
                 results.append({"table": reference, "rows": 0, "deleted": 0})
                 continue
-            content_type, streamed, columns = stream_archive_rows(connection, job, schema, table, column, cutoff, path, extra_where=extra_where)
+            content_type, streamed, columns = stream_archive_rows(
+                connection,
+                job,
+                schema,
+                table,
+                column,
+                cutoff,
+                path,
+                extra_where=extra_where,
+                candidate_table=candidate_table,
+                primary_keys=primary_keys,
+            )
+            if streamed != eligible:
+                connection.rollback()
+                raise AdapterError(
+                    f"Archive refused for {reference}: locked identity set has {eligible} row(s) "
+                    f"but serialization produced {streamed}. No source rows were deleted."
+                )
             key = data_key(job, run_id, schema, table, extension)
             uploaded = upload_to_r2(job, path, key, content_type)
             uploaded.update({"format": extension, "kind": "data", "table": reference, "rows": streamed, "age_column": column, "cutoff": cutoff})
-            min_value, max_value = archive_bounds(connection, job, schema, table, column, cutoff, extra_where=extra_where)
-            primary_keys = table_primary_keys(connection, job, schema, table)
+            min_value, max_value = archive_bounds(
+                connection,
+                job,
+                schema,
+                table,
+                column,
+                cutoff,
+                extra_where=extra_where,
+                candidate_table=candidate_table,
+                primary_keys=primary_keys,
+            )
             manifest = build_manifest(
                 job,
                 run_id,
@@ -1124,6 +1689,11 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
                     "content_type": content_type,
                     "size_bytes": uploaded["size_bytes"],
                     "etag": uploaded.get("etag"),
+                    "sha256": uploaded["sha256"],
+                    "checksum_algorithm": uploaded["checksum_algorithm"],
+                    "verified": uploaded["verified"],
+                    "verification_method": uploaded["verification_method"],
+                    "verified_at": uploaded["verified_at"],
                 },
                 columns=columns,
                 primary_keys=primary_keys,
@@ -1131,23 +1701,57 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
                 max_value=max_value,
             )
             manifest_uploaded = upload_manifest(job, manifest, temp_dir)
+            if archive_state_callback:
+                # If the durable local journal cannot record the ready archive,
+                # fail closed before touching source rows.
+                archive_state_callback(manifest)
             cursor = connection.cursor()
             try:
-                cursor.execute(
-                    f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
-                    (cutoff,),
-                )
+                committed_at = dt.datetime.now(dt.timezone.utc).isoformat()
+                source_committed_manifest = {
+                    **manifest,
+                    "status": "source_delete_committed",
+                    "deleted_rows": streamed,
+                    "source_delete_committed_at": committed_at,
+                }
+                # The source-side outbox row and DELETE commit atomically. If
+                # this process dies immediately after COMMIT, the next run can
+                # still promote the already verified R2 manifest safely.
+                write_source_outbox(connection, source_committed_manifest)
+                if candidate_table:
+                    join = postgres_identity_join(primary_keys)
+                    cursor.execute(
+                        f"DELETE FROM {reference} AS source USING {candidate_table} AS candidate_keys "
+                        f"WHERE {join}"
+                    )
+                else:
+                    cursor.execute(
+                        f"DELETE FROM {reference} WHERE {quote_identifier(engine, column)} < {sql_placeholder(engine)}{extra_where}",
+                        (cutoff,),
+                    )
                 deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else streamed
+                if deleted != streamed:
+                    raise AdapterError(
+                        f"Archive/delete mismatch for {reference}: archived {streamed} row(s) "
+                        f"but DELETE matched {deleted}. Transaction rolled back."
+                    )
                 connection.commit()
             except Exception as error:
                 connection.rollback()
                 if not is_foreign_key_violation(error):
+                    manifest["status"] = "failed"
+                    manifest["error_message"] = str(error)[:4000]
+                    upload_manifest(job, manifest, temp_dir)
+                    if archive_state_callback:
+                        archive_state_callback(manifest)
                     raise
                 manifest["error_message"] = f"Deletion deferred because newer child rows still reference this table: {str(error)[:240]}"
                 # Keep this manifest in ready state. Consumers ignore it while
                 # the source row remains hot; a later run can archive it again
                 # after its remaining child rows become eligible.
                 manifest_uploaded = upload_manifest(job, manifest, temp_dir)
+                if archive_state_callback:
+                    archive_state_callback(manifest)
                 uploaded["kind"] = "data_deferred"
                 uploaded["deleted"] = 0
                 uploaded["manifest_key"] = manifest["manifest_key"]
@@ -1166,10 +1770,17 @@ def process_row_job(job: Any, run_id: int, temp_dir: Path, archive: bool) -> lis
                     },
                 ])
                 continue
+            manifest.update(source_committed_manifest)
+            if archive_state_callback:
+                # This local recovery marker is written after the source commit
+                # and before the portable R2 manifest is promoted to committed.
+                archive_state_callback(manifest)
             manifest["status"] = "committed"
-            manifest["deleted_rows"] = deleted
             manifest["committed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
             manifest_uploaded = upload_manifest(job, manifest, temp_dir)
+            if archive_state_callback:
+                archive_state_callback(manifest)
+            delete_source_outbox(connection, manifest["archive_id"])
             uploaded["deleted"] = deleted
             uploaded["manifest_key"] = manifest["manifest_key"]
             results.extend([uploaded, manifest_uploaded])

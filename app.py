@@ -31,10 +31,37 @@ SCHEDULER_SCRIPT = Path(os.getenv("VAULTLINE_SCHEDULER", BASE_DIR / "scheduler.p
 LOG_DIR = Path(os.getenv("VAULTLINE_LOG_DIR", "/var/log/vaultline"))
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("VAULTLINE_SECRET", "change-this-in-production")
+ENVIRONMENT = os.getenv("VAULTLINE_ENV", "production").strip().lower()
+IS_DEVELOPMENT = ENVIRONMENT == "development"
+if ENVIRONMENT not in {"development", "production", "test"}:
+    raise RuntimeError("VAULTLINE_ENV must be development, test, or production.")
+if IS_DEVELOPMENT or ENVIRONMENT == "test":
+    secret_key = os.getenv("VAULTLINE_SECRET", "development-only-vaultline-secret-key")
+    ADMIN_USERNAME = os.getenv("VAULTLINE_ADMIN_USERNAME", "vaultline@admin")
+    ADMIN_PASSWORD = os.getenv("VAULTLINE_ADMIN_PASSWORD", "VaultLine@Admin12345")
+else:
+    required = {
+        "VAULTLINE_SECRET": os.getenv("VAULTLINE_SECRET", ""),
+        "VAULTLINE_ADMIN_USERNAME": os.getenv("VAULTLINE_ADMIN_USERNAME", ""),
+        "VAULTLINE_ADMIN_PASSWORD": os.getenv("VAULTLINE_ADMIN_PASSWORD", ""),
+    }
+    missing = [key for key, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(f"Production configuration is missing: {', '.join(missing)}")
+    if len(required["VAULTLINE_SECRET"]) < 32:
+        raise RuntimeError("VAULTLINE_SECRET must contain at least 32 characters in production.")
+    if len(required["VAULTLINE_ADMIN_PASSWORD"]) < 16:
+        raise RuntimeError("VAULTLINE_ADMIN_PASSWORD must contain at least 16 characters in production.")
+    secret_key = required["VAULTLINE_SECRET"]
+    ADMIN_USERNAME = required["VAULTLINE_ADMIN_USERNAME"]
+    ADMIN_PASSWORD = required["VAULTLINE_ADMIN_PASSWORD"]
+app.config.update(
+    SECRET_KEY=secret_key,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    SESSION_COOKIE_SECURE=ENVIRONMENT == "production",
+)
 app.config["DATABASE"] = DATABASE
-ADMIN_USERNAME = os.getenv("VAULTLINE_ADMIN_USERNAME", "vaultline@admin")
-ADMIN_PASSWORD = os.getenv("VAULTLINE_ADMIN_PASSWORD", "VaultLine@Admin12345")
 
 
 def get_db() -> sqlite3.Connection:
@@ -140,6 +167,9 @@ def init_db() -> None:
             format TEXT NOT NULL,
             size_bytes INTEGER NOT NULL DEFAULT 0,
             etag TEXT,
+            sha256 TEXT,
+            checksum_algorithm TEXT,
+            verified_at TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (run_id) REFERENCES job_runs(id) ON DELETE CASCADE,
             FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
@@ -169,8 +199,24 @@ def init_db() -> None:
             schema_hash TEXT,
             error_message TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            source_delete_committed_at TEXT,
             committed_at TEXT,
             FOREIGN KEY (run_id) REFERENCES job_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS restore_drills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            object_id INTEGER NOT NULL,
+            job_id INTEGER NOT NULL,
+            mode TEXT NOT NULL,
+            target_database TEXT,
+            status TEXT NOT NULL,
+            verification_json TEXT NOT NULL DEFAULT '{}',
+            error_message TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT,
+            FOREIGN KEY (object_id) REFERENCES r2_objects(id) ON DELETE CASCADE,
             FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
         );
         """
@@ -188,6 +234,40 @@ def init_db() -> None:
     if "updated_at" not in run_columns:
         db.execute("ALTER TABLE job_runs ADD COLUMN updated_at TEXT")
         db.execute("UPDATE job_runs SET updated_at = COALESCE(finished_at, started_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL")
+    object_columns = {row[1] for row in db.execute("PRAGMA table_info(r2_objects)").fetchall()}
+    for column, definition in (
+        ("sha256", "TEXT"),
+        ("checksum_algorithm", "TEXT"),
+        ("verified_at", "TEXT"),
+    ):
+        if column not in object_columns:
+            db.execute(f"ALTER TABLE r2_objects ADD COLUMN {column} {definition}")
+    manifest_columns = {row[1] for row in db.execute("PRAGMA table_info(archive_manifests)").fetchall()}
+    for column, definition in (
+        ("updated_at", "TEXT"),
+        ("source_delete_committed_at", "TEXT"),
+    ):
+        if column not in manifest_columns:
+            db.execute(f"ALTER TABLE archive_manifests ADD COLUMN {column} {definition}")
+    db.execute("UPDATE archive_manifests SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)")
+    # Repair any legacy duplicate active runs before enforcing an atomic
+    # single-worker invariant. The newest run remains authoritative.
+    db.execute(
+        """UPDATE job_runs AS older
+              SET status = 'failed', finished_at = CURRENT_TIMESTAMP,
+                  updated_at = CURRENT_TIMESTAMP,
+                  message = 'Superseded while installing single-worker protection'
+            WHERE status = 'running'
+              AND EXISTS (
+                    SELECT 1 FROM job_runs AS newer
+                     WHERE newer.job_id = older.job_id
+                       AND newer.status = 'running' AND newer.id > older.id
+              )"""
+    )
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_runs_one_running "
+        "ON job_runs(job_id) WHERE status = 'running'"
+    )
     # Seed the reusable default target from an existing configured job once.
     existing_default = db.execute("SELECT 1 FROM settings WHERE key = 'r2_account_id'").fetchone()
     if not existing_default:
@@ -442,7 +522,16 @@ def inject_globals():
         "logged_in_user": session.get("username"),
         "scheduler_status": scheduler_info(),
         "human_bytes": human_bytes,
+        "csrf_token": csrf_token,
     }
+
+
+def csrf_token() -> str:
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
 
 
 @app.before_request
@@ -451,12 +540,32 @@ def prepare_database():
 
 
 @app.before_request
+def verify_csrf():
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return None
+    expected = session.get("csrf_token", "")
+    supplied = request.headers.get("X-CSRF-Token", "") or request.form.get("csrf_token", "")
+    if not expected or not supplied or not secrets.compare_digest(expected, supplied):
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "message": "CSRF token is missing or invalid."}), 403
+        return Response("CSRF token is missing or invalid.", status=403)
+    return None
+
+
+@app.before_request
 def require_login():
-    if request.endpoint == "static" or request.endpoint == "login":
+    if request.endpoint in {"static", "login", "healthz"}:
         return None
     if not session.get("authenticated"):
         return redirect(url_for("login", next=request.path))
     return None
+
+
+@app.get("/healthz")
+def healthz():
+    """Minimal unauthenticated liveness/readiness probe for Gunicorn/Nginx."""
+    get_db().execute("SELECT 1").fetchone()
+    return jsonify({"status": "ok", "ready": True})
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -467,11 +576,14 @@ def login():
         username = request.form.get("username", "")
         password = request.form.get("password", "")
         if secrets.compare_digest(username, ADMIN_USERNAME) and secrets.compare_digest(password, ADMIN_PASSWORD):
+            csrf = session.get("csrf_token")
             session.clear()
+            session["csrf_token"] = csrf or secrets.token_urlsafe(32)
             session["authenticated"] = True
             session["username"] = username
             next_path = request.args.get("next", "")
-            return redirect(next_path if next_path.startswith("/") else url_for("dashboard"))
+            safe_next = next_path.startswith("/") and not next_path.startswith("//")
+            return redirect(next_path if safe_next else url_for("dashboard"))
         flash("Invalid username or password.", "error")
     return render_template("login.html")
 
@@ -568,6 +680,17 @@ def delete_job(job_id: int):
     db = get_db()
     job = db.execute("SELECT name FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if job:
+        history_count = sum(
+            db.execute(f"SELECT COUNT(*) FROM {table} WHERE job_id = ?", (job_id,)).fetchone()[0]
+            for table in ("job_runs", "r2_objects", "archive_manifests", "restore_drills")
+        )
+        if history_count:
+            db.execute("UPDATE jobs SET enabled = 0 WHERE id = ?", (job_id,))
+            db.commit()
+            sync_cron_file()
+            log_activity("Job retained", f"{job['name']} · disabled; audit history is immutable", "amber")
+            flash("This job has run/archive history and cannot be deleted. It was disabled instead.", "error")
+            return redirect(request.referrer or url_for("jobs"))
         db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         db.commit()
         cron_ok, cron_message = sync_cron_file()

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Vaultline · {{ active or 'Overview' }}</title>
   <meta name="description" content="Universal database backup, retention and archive manager for Linode and Cloudflare R2.">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
   <script>document.documentElement.dataset.theme = localStorage.getItem('vaultline-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
@@ -27,7 +28,7 @@
       </nav>
       <div class="sidebar-bottom">
         <div class="agent-status"><span class="agent-icon">{{ icon('server', 15) }}</span><span><strong>System scheduler</strong><small><i class="{% if scheduler_status.ready %}online-dot{% else %}offline-dot{% endif %}"></i> {{ scheduler_status.label }}</small></span><span class="more">···</span></div>
-        <div class="account"><span class="account-avatar">VA</span><span><strong>{{ logged_in_user or 'Vaultline admin' }}</strong><small>Administrator</small></span><form method="post" action="{{ url_for('logout') }}"><button class="logout-link" title="Log out" aria-label="Log out">{{ icon('logout', 16) }}</button></form></div>
+        <div class="account"><span class="account-avatar">VA</span><span><strong>{{ logged_in_user or 'Vaultline admin' }}</strong><small>Administrator</small></span><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="logout-link" title="Log out" aria-label="Log out">{{ icon('logout', 16) }}</button></form></div>
       </div>
     </aside>
     <main class="main">

@@ -9,12 +9,114 @@ import sqlite3
 import sys
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app import app, get_db, init_db
-from worker_adapters import AdapterError, create_backup_artifact, preview_row_job, process_row_job, upload_backup_artifact
+from worker_adapters import (
+    AdapterError,
+    create_backup_artifact,
+    preview_row_job,
+    process_row_job,
+    upload_backup_artifact,
+    upload_manifest,
+)
+
+
+def persist_archive_manifest(run_id: int, job_id: int, manifest: dict) -> None:
+    """Durably journal every archive transition for crash recovery/auditing."""
+    db = get_db()
+    db.execute(
+        """INSERT INTO archive_manifests
+           (archive_id, run_id, job_id, namespace, engine, database_name, schema_name,
+            table_name, status, format, age_column, cutoff_value, min_value, max_value,
+            row_count, deleted_rows, manifest_key, data_objects_json, columns_json,
+            primary_keys_json, schema_hash, error_message, source_delete_committed_at,
+            committed_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(archive_id) DO UPDATE SET
+             status = excluded.status,
+             deleted_rows = excluded.deleted_rows,
+             data_objects_json = excluded.data_objects_json,
+             error_message = excluded.error_message,
+             source_delete_committed_at = excluded.source_delete_committed_at,
+             committed_at = excluded.committed_at,
+             updated_at = CURRENT_TIMESTAMP""",
+        (
+            manifest["archive_id"], run_id, job_id, manifest["namespace"], manifest["engine"],
+            manifest["database_name"], manifest["schema_name"], manifest["table_name"],
+            manifest["status"], manifest["format"], manifest["age_column"], manifest["cutoff_value"],
+            manifest.get("min_value"), manifest.get("max_value"), manifest["row_count"],
+            manifest["deleted_rows"], manifest["manifest_key"], json.dumps(manifest["data_objects"]),
+            json.dumps(manifest["columns"]), json.dumps(manifest["primary_keys"]),
+            manifest["schema_hash"], manifest.get("error_message", ""),
+            manifest.get("source_delete_committed_at"), manifest.get("committed_at"),
+        ),
+    )
+    db.commit()
+
+
+def manifest_from_journal(row, job) -> dict:
+    """Rebuild the portable manifest needed to finish a post-delete promotion."""
+    data_objects = json.loads(row["data_objects_json"] or "[]")
+    verified = bool(data_objects) and all(item.get("verified") for item in data_objects)
+    return {
+        "contract_version": 1,
+        "archive_id": row["archive_id"],
+        "status": "committed",
+        "namespace": row["namespace"],
+        "engine": row["engine"],
+        "database_name": row["database_name"],
+        "connection_name": job["connection_name"],
+        "schema_name": row["schema_name"],
+        "table_name": row["table_name"],
+        "age_column": row["age_column"],
+        "cutoff_value": row["cutoff_value"],
+        "min_value": row["min_value"],
+        "max_value": row["max_value"],
+        "row_count": row["row_count"],
+        "deleted_rows": row["deleted_rows"],
+        "format": row["format"],
+        "columns": json.loads(row["columns_json"] or "[]"),
+        "primary_keys": json.loads(row["primary_keys_json"] or "[]"),
+        "schema_hash": row["schema_hash"],
+        "integrity": {
+            "algorithm": "sha256",
+            "verification_method": "full_object_readback_sha256",
+            "all_data_objects_verified": verified,
+        },
+        "data_objects": data_objects,
+        "manifest_key": row["manifest_key"],
+        "created_at": row["created_at"],
+        "source_delete_committed_at": row["source_delete_committed_at"],
+        "committed_at": datetime.now(timezone.utc).isoformat(),
+        "error_message": row["error_message"] or "",
+    }
+
+
+def recover_manifest_promotions(job, temp_dir: Path) -> int:
+    """Promote manifests whose source deletion committed before a prior crash.
+
+    This operation only rewrites the small manifest object. The archived Parquet
+    object was already checksum-verified and source rows are never touched again.
+    """
+    db = get_db()
+    rows = db.execute(
+        """SELECT * FROM archive_manifests
+            WHERE job_id = ? AND status = 'source_delete_committed'
+            ORDER BY id""",
+        (job["id"],),
+    ).fetchall()
+    for row in rows:
+        manifest = manifest_from_journal(row, job)
+        if not manifest["integrity"]["all_data_objects_verified"]:
+            raise AdapterError(
+                f"Cannot recover archive {row['archive_id']}: verified data-object metadata is missing."
+            )
+        upload_manifest(job, manifest, temp_dir)
+        persist_archive_manifest(row["run_id"], job["id"], manifest)
+    return len(rows)
 
 
 def event(run_id: int, status: str, progress: int, message: str, finish: bool = False) -> None:
@@ -83,14 +185,31 @@ def run_job(job_id: int) -> int:
         if not is_biweekly_due(job):
             print(f"Vaultline job {job_id} is not due on this biweekly week")
             return 0
+        # A killed worker cannot emit a terminal event. Heartbeats arrive every
+        # ten seconds, so two minutes without one is a safe stale-run boundary.
+        db.execute(
+            """UPDATE job_runs
+                  SET status = 'failed', progress = 100,
+                      message = 'Worker heartbeat expired; marked stale for automatic recovery',
+                      updated_at = CURRENT_TIMESTAMP, finished_at = CURRENT_TIMESTAMP
+                WHERE job_id = ? AND status = 'running'
+                  AND datetime(COALESCE(updated_at, started_at)) < datetime('now', '-2 minutes')""",
+            (job_id,),
+        )
+        db.commit()
         running = db.execute("SELECT id FROM job_runs WHERE job_id = ? AND status = 'running'", (job_id,)).fetchone()
         if running:
             print(f"Vaultline job {job_id} is already running", file=sys.stderr)
             return 0
-        cursor = db.execute(
-            "INSERT INTO job_runs (job_id, status, progress, message) VALUES (?, 'running', 0, ?)",
-            (job_id, "Worker started"),
-        )
+        try:
+            cursor = db.execute(
+                "INSERT INTO job_runs (job_id, status, progress, message) VALUES (?, 'running', 0, ?)",
+                (job_id, "Worker started"),
+            )
+        except sqlite3.IntegrityError:
+            db.rollback()
+            print(f"Vaultline job {job_id} was claimed by another worker", file=sys.stderr)
+            return 0
         db.commit()
         run_id = cursor.lastrowid
         heartbeat_stop = threading.Event()
@@ -121,8 +240,13 @@ def run_job(job_id: int) -> int:
                     event(run_id, "running", 75, f"Native backup created ({artifact.stat().st_size} bytes); uploading to R2")
                     uploaded = upload_backup_artifact(job, run_id, artifact, content_type)
                     db.execute(
-                        "INSERT INTO r2_objects (run_id, job_id, bucket, object_key, format, size_bytes, etag) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (run_id, job["id"], uploaded["bucket"], uploaded["key"], uploaded["format"], uploaded["size_bytes"], uploaded.get("etag")),
+                        """INSERT INTO r2_objects
+                           (run_id, job_id, bucket, object_key, format, size_bytes, etag,
+                            sha256, checksum_algorithm, verified_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (run_id, job["id"], uploaded["bucket"], uploaded["key"], uploaded["format"],
+                         uploaded["size_bytes"], uploaded.get("etag"), uploaded.get("sha256"),
+                         uploaded.get("checksum_algorithm"), uploaded.get("verified_at")),
                     )
                     db.commit()
                     event(run_id, "running", 90, f"Uploaded and verified {uploaded['key']} ({uploaded['size_bytes']} bytes)")
@@ -130,33 +254,40 @@ def run_job(job_id: int) -> int:
                     return 0
                 if job["job_type"] in {"archive", "retention"}:
                     archive = job["job_type"] == "archive"
+                    if archive:
+                        recovered = recover_manifest_promotions(job, temp_dir)
+                        if recovered:
+                            event(
+                                run_id,
+                                "running",
+                                58,
+                                f"Recovered {recovered} committed archive manifest promotion(s)",
+                            )
                     event(run_id, "running", 60, "Validated retention scope; processing source tables")
-                    results = process_row_job(job, run_id, temp_dir, archive=archive)
+                    results = process_row_job(
+                        job,
+                        run_id,
+                        temp_dir,
+                        archive=archive,
+                        archive_state_callback=(
+                            (lambda manifest: persist_archive_manifest(run_id, job["id"], manifest))
+                            if archive else None
+                        ),
+                    )
                     for uploaded in results:
                         if uploaded.get("key"):
                             db.execute(
-                                "INSERT INTO r2_objects (run_id, job_id, bucket, object_key, format, size_bytes, etag) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                (run_id, job["id"], uploaded["bucket"], uploaded["key"], uploaded["format"], uploaded["size_bytes"], uploaded.get("etag")),
+                                """INSERT INTO r2_objects
+                                   (run_id, job_id, bucket, object_key, format, size_bytes, etag,
+                                    sha256, checksum_algorithm, verified_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (run_id, job["id"], uploaded["bucket"], uploaded["key"], uploaded["format"],
+                                 uploaded["size_bytes"], uploaded.get("etag"), uploaded.get("sha256"),
+                                 uploaded.get("checksum_algorithm"), uploaded.get("verified_at")),
                             )
                         manifest = uploaded.get("manifest")
                         if manifest:
-                            db.execute(
-                                """INSERT OR REPLACE INTO archive_manifests
-                                   (archive_id, run_id, job_id, namespace, engine, database_name, schema_name,
-                                    table_name, status, format, age_column, cutoff_value, min_value, max_value,
-                                    row_count, deleted_rows, manifest_key, data_objects_json, columns_json,
-                                    primary_keys_json, schema_hash, error_message, committed_at)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (
-                                    manifest["archive_id"], run_id, job["id"], manifest["namespace"], manifest["engine"],
-                                    manifest["database_name"], manifest["schema_name"], manifest["table_name"],
-                                    manifest["status"], manifest["format"], manifest["age_column"], manifest["cutoff_value"],
-                                    manifest.get("min_value"), manifest.get("max_value"), manifest["row_count"],
-                                    manifest["deleted_rows"], manifest["manifest_key"], json.dumps(manifest["data_objects"]),
-                                    json.dumps(manifest["columns"]), json.dumps(manifest["primary_keys"]),
-                                    manifest["schema_hash"], manifest.get("error_message", ""), manifest.get("committed_at"),
-                                ),
-                            )
+                            persist_archive_manifest(run_id, job["id"], manifest)
                     db.commit()
                     data_results = [
                         item for item in results
