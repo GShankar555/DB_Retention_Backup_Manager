@@ -9,7 +9,7 @@
     <td><span class="source">{{ icon('database', 13) }} {{ job.engine }} · {{ job.database_name }}</span></td>
     <td><span class="pill">{% if job.job_type == 'backup' %}Backup to R2{% elif job.job_type == 'archive' %}Archive & purge{% else %}Data retention{% endif %}</span></td>
     <td><span class="source">{{ icon('refresh', 13) }} {{ job.cadence }}</span></td>
-    <td>{{ job.run_date }} · {{ job.run_time }}</td>
+    <td>{{ job.next_run_label or '—' }}</td>
     <td><span class="status {% if job.enabled %}healthy{% else %}review{% endif %}"><i></i>{{ 'Enabled' if job.enabled else 'Disabled' }}</span><small class="job-run-summary">{{ current_status|replace('_', ' ')|title }}</small></td>
     <td class="job-actions">
       <form method="post" action="{{ url_for('set_job_state', job_id=job.id) }}" class="inline-form"><input type="hidden" name="action" value="{{ 'disable' if job.enabled else 'enable' }}"><button class="button secondary small job-state-action" type="submit">{{ 'Disable' if job.enabled else 'Enable' }}</button></form>

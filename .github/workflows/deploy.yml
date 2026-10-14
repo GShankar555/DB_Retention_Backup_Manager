@@ -35,7 +35,7 @@ jobs:
           python -m pip check
 
       - name: Compile application and scripts
-        run: python -m compileall -q app.py archive_contract.py restore_drill.py scheduler.py secret_values.py worker.py worker_adapters.py scripts
+        run: python -m compileall -q app.py archive_contract.py restore_drill.py scheduler.py scheduling.py secret_values.py worker.py worker_adapters.py scripts
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
@@ -78,7 +78,7 @@ jobs:
             python -m pip install --upgrade pip
             python -m pip install -r requirements.txt
             python -m pip check
-            python -m compileall -q app.py archive_contract.py restore_drill.py scheduler.py secret_values.py worker.py worker_adapters.py scripts
+            python -m compileall -q app.py archive_contract.py restore_drill.py scheduler.py scheduling.py secret_values.py worker.py worker_adapters.py scripts
 
             sudo systemctl restart gunicorn_db_manager
             sudo systemctl reload nginx

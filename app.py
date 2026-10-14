@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, Response, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
 from dotenv import load_dotenv
+from scheduling import scheduled_job
 from secret_values import connection_password
 from worker_adapters import preview_row_job
 
@@ -597,10 +598,20 @@ def logout():
 @app.route("/")
 def dashboard():
     db = get_db()
-    jobs = fetch_jobs()
+    job_rows = fetch_jobs()
+    jobs = []
+    scheduled_jobs = []
+    for row in job_rows:
+        job = dict(row)
+        scheduled = scheduled_job(row)
+        job["next_run_label"] = scheduled["next_run_label"] if scheduled else None
+        jobs.append(job)
+        if scheduled:
+            scheduled_jobs.append(scheduled)
+    scheduled_jobs.sort(key=lambda job: job["next_run_utc"])
     connections = db.execute("SELECT * FROM connections ORDER BY id").fetchall()
     activities = db.execute("SELECT * FROM activity ORDER BY id DESC LIMIT 5").fetchall()
-    next_job = jobs[0] if jobs else None
+    next_job = scheduled_jobs[0] if scheduled_jobs else None
     metrics = {
         "stored_r2_bytes": db.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM r2_objects").fetchone()[0],
         "executions": db.execute("SELECT COUNT(*) FROM job_runs WHERE status = 'success'").fetchone()[0],
@@ -610,6 +621,7 @@ def dashboard():
         "dashboard.html",
         active="Overview",
         jobs=jobs,
+        scheduled_jobs=scheduled_jobs,
         connections=connections,
         activities=activities,
         protected_count=len(connections),
@@ -628,7 +640,13 @@ def jobs():
         query += " WHERE jobs.job_type = ?"
         params.append(filter_type)
     query += " ORDER BY jobs.id DESC"
-    jobs = db.execute(query, params).fetchall()
+    job_rows = db.execute(query, params).fetchall()
+    jobs = []
+    for row in job_rows:
+        job = dict(row)
+        scheduled = scheduled_job(row)
+        job["next_run_label"] = scheduled["next_run_label"] if scheduled else None
+        jobs.append(job)
     return render_template("jobs.html", active="Jobs", jobs=jobs, filter_type=filter_type)
 
 

@@ -6,11 +6,10 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-from croniter import croniter
+from zoneinfo import ZoneInfoNotFoundError
 
 from app import BASE_DIR, LOG_DIR, WORKER_SCRIPT, app, get_db
+from scheduling import job_is_due
 
 
 def due_job_ids(now_utc: datetime) -> list[int]:
@@ -21,15 +20,8 @@ def due_job_ids(now_utc: datetime) -> list[int]:
         ).fetchall()
         for job in jobs:
             try:
-                local = now_utc.astimezone(ZoneInfo(job["timezone"] or "UTC"))
-                local = local.replace(second=0, microsecond=0)
-                if not croniter.match(job["cron_expression"], local, precision_in_seconds=1):
-                    continue
-                if job["cadence"] == "Biweekly":
-                    anchor = datetime.strptime(job["run_date"], "%Y-%m-%d").date()
-                    if local.date() < anchor or (local.date() - anchor).days % 14:
-                        continue
-                due.append(job["id"])
+                if job_is_due(job, now_utc):
+                    due.append(job["id"])
             except (ValueError, KeyError, TypeError, ZoneInfoNotFoundError) as error:
                 print(f"Vaultline job {job['id']} has an invalid schedule: {error}", file=sys.stderr)
     return due
