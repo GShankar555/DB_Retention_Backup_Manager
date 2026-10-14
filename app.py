@@ -754,7 +754,7 @@ def connections():
             request.form.get("name", "").strip(), request.form.get("engine", "PostgreSQL"),
             request.form.get("host", "").strip(), request.form.get("port", type=int) or 5432,
             request.form.get("database_name", "").strip(), request.form.get("username", "").strip(),
-            "", request.form.get("ssl_mode", "require"),
+            request.form.get("password", ""), request.form.get("ssl_mode", "require"),
         )
         if not all(values[index] for index in (0, 2, 4, 5)):
             flash("Name, host, database and username are required.", "error")
